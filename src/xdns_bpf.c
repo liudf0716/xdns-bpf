@@ -10,6 +10,10 @@
 
 #include "xdns_bpf.h"
 
+#ifndef LIBBPF_PIN_BY_NAME
+#define LIBBPF_PIN_BY_NAME 1
+#endif
+
 #define MAX_DNS_NAME_LEN 128
 #define MAX_DNS_LABELS   8
 
@@ -19,6 +23,7 @@ struct {
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, __u8);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_whitelist SEC(".maps");
 
 /* DNS session map for reverse-SNAT */
@@ -27,6 +32,7 @@ struct {
     __uint(max_entries, 65536);
     __type(key, struct xdns_session_key);
     __type(value, struct xdns_session_val);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_sessions SEC(".maps");
 
 /* Resolved IP set: IPv4 (network byte order) -> expire timestamp (ns) */
@@ -35,6 +41,7 @@ struct {
     __uint(max_entries, 32768);
     __type(key, __u32);
     __type(value, __u64);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_ip_set SEC(".maps");
 
 /* Config map */
@@ -43,6 +50,7 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct xdns_config);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_config_map SEC(".maps");
 
 /* Statistics */
@@ -51,6 +59,7 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct xdns_stats);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_stats_map SEC(".maps");
 
 /* DNS Header */
