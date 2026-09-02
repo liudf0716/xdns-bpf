@@ -82,11 +82,14 @@ struct dnshdr {
 } __attribute__((packed));
 
 
-/* Parse DNS QNAME from payload and test against whitelist */
+/* Parse DNS QNAME from payload and test against whitelist (supports wildcard subdomains) */
 static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
 {
     unsigned char *ptr = (unsigned char *)data + udp_offset + sizeof(struct udphdr) + sizeof(struct dnshdr);
-    __u64 h = XDNS_FNV1A_64_OFFSET;
+    __u64 h_full = XDNS_FNV1A_64_OFFSET;
+    __u64 h_sub1 = 0;
+    __u64 h_sub2 = 0;
+    __u64 h_sub3 = 0;
     int started = 0;
 
     /* Single linear scan of QNAME (up to 64 bytes) */
@@ -99,25 +102,64 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
         ptr++;
 
         if (c == 0) {
-            /* End of QNAME: check if hash matches whitelist */
-            __u8 *found = bpf_map_lookup_elem(&xdns_whitelist, &h);
-            return (found && *found == 1);
+            /* End of QNAME: check full domain and parent domains against whitelist */
+            __u8 *found = bpf_map_lookup_elem(&xdns_whitelist, &h_full);
+            if (found && *found == 1) return 1;
+
+            if (h_sub2) {
+                found = bpf_map_lookup_elem(&xdns_whitelist, &h_sub2);
+                if (found && *found == 1) return 1;
+            }
+            if (h_sub3) {
+                found = bpf_map_lookup_elem(&xdns_whitelist, &h_sub3);
+                if (found && *found == 1) return 1;
+            }
+            if (h_sub1) {
+                found = bpf_map_lookup_elem(&xdns_whitelist, &h_sub1);
+                if (found && *found == 1) return 1;
+            }
+            return 0;
         }
 
         if (c <= 63) {
-            if (started) {
-                /* Label boundary: convert to '.' */
-                c = '.';
-            } else {
+            if (!started) {
                 started = 1;
                 continue;
             }
+            h_sub3 = h_sub2;
+            h_sub2 = h_sub1;
+            h_sub1 = XDNS_FNV1A_64_OFFSET;
+            c = '.';
         } else if (c >= 'A' && c <= 'Z') {
             c += ('a' - 'A');
         }
 
-        h ^= c;
-        h *= XDNS_FNV1A_64_PRIME;
+        h_full ^= c;
+        h_full *= XDNS_FNV1A_64_PRIME;
+
+        if (c == '.') {
+            if (h_sub2 && h_sub2 != XDNS_FNV1A_64_OFFSET) {
+                h_sub2 ^= c;
+                h_sub2 *= XDNS_FNV1A_64_PRIME;
+            }
+            if (h_sub3 && h_sub3 != XDNS_FNV1A_64_OFFSET) {
+                h_sub3 ^= c;
+                h_sub3 *= XDNS_FNV1A_64_PRIME;
+            }
+        } else {
+            if (h_sub1) {
+                h_sub1 ^= c;
+                h_sub1 *= XDNS_FNV1A_64_PRIME;
+            }
+            if (h_sub2) {
+                h_sub2 ^= c;
+                h_sub2 *= XDNS_FNV1A_64_PRIME;
+            }
+            if (h_sub3) {
+                h_sub3 ^= c;
+                h_sub3 *= XDNS_FNV1A_64_PRIME;
+            }
+        }
     }
 
     return 0;

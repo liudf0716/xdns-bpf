@@ -82,8 +82,8 @@ static void print_usage(const char *prog)
     printf("xdns-ctl - Control CLI for xdns-bpf\n\n");
     printf("Usage: %s <command> [arguments]\n\n", prog);
     printf("Commands:\n");
-    printf("  add-domain <domain>                Add domain to whitelist\n");
-    printf("  del-domain <domain>                Remove domain from whitelist\n");
+    printf("  add-domain <domain> [file]         Add domain to kernel and persistent whitelist\n");
+    printf("  del-domain <domain> [file]         Remove domain from kernel and whitelist file\n");
     printf("  list-whitelist [file]              List whitelisted domains and kernel map status\n");
     printf("  load-whitelist <file>              Batch load domain whitelist file\n");
     printf("  list-ips                           List dynamic hijacked IP set\n");
@@ -94,40 +94,147 @@ static void print_usage(const char *prog)
     printf("\n");
 }
 
-static int cmd_add_domain(const char *domain)
+static const char *get_default_whitelist_path(const char *user_file)
 {
+    if (user_file && user_file[0] != '\0')
+        return user_file;
+    if (access("/etc/xdns/whitelist.txt", F_OK) == 0 || access("/etc/xdns", W_OK) == 0)
+        return "/etc/xdns/whitelist.txt";
+    if (access("files/whitelist.txt", F_OK) == 0)
+        return "files/whitelist.txt";
+    return "whitelist.txt";
+}
+
+static void normalize_domain(const char *in, char *out, size_t maxlen)
+{
+    while (*in == ' ' || *in == '\t') in++;
+    /* Strip leading *. or . if user specified wildcard prefix */
+    if (in[0] == '*' && in[1] == '.') in += 2;
+    else if (in[0] == '.') in += 1;
+
+    size_t i = 0;
+    while (*in && i < maxlen - 1) {
+        char c = *in++;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '#') break;
+        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+        out[i++] = c;
+    }
+    out[i] = '\0';
+}
+
+static int cmd_add_domain(const char *domain, const char *file)
+{
+    char norm[256];
+    normalize_domain(domain, norm, sizeof(norm));
+    if (norm[0] == '\0') {
+        fprintf(stderr, "Error: Invalid domain name '%s'\n", domain);
+        return 1;
+    }
+
     int fd = bpf_open_map("xdns_whitelist");
     if (fd < 0) {
         perror("Failed to open xdns_whitelist map");
         return 1;
     }
-    __u64 hash = xdns_hash_domain(domain);
+    __u64 hash = xdns_hash_domain(norm);
     __u8 val = 1;
     if (bpf_map_update(fd, &hash, &val, BPF_ANY) < 0) {
         perror("Failed to update whitelist map");
         close(fd);
         return 1;
     }
-    printf("Added domain '%s' (hash: 0x%016llx) to whitelist\n", domain, (unsigned long long)hash);
     close(fd);
+
+    printf("Kernel: Activated '%s' (hash: 0x%016llx)\n", norm, (unsigned long long)hash);
+
+    /* Persist to whitelist file */
+    const char *target_file = get_default_whitelist_path(file);
+    int already_in_file = 0;
+    FILE *fp = fopen(target_file, "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            char existing[256];
+            normalize_domain(line, existing, sizeof(existing));
+            if (strcasecmp(existing, norm) == 0) {
+                already_in_file = 1;
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    if (!already_in_file) {
+        fp = fopen(target_file, "a");
+        if (fp) {
+            fprintf(fp, "%s\n", norm);
+            fclose(fp);
+            printf("File  : Appended '%s' to %s\n", norm, target_file);
+        } else {
+            fprintf(stderr, "Notice: Could not write to %s (read-only or permission denied)\n", target_file);
+        }
+    } else {
+        printf("File  : Domain '%s' already exists in %s\n", norm, target_file);
+    }
+
     return 0;
 }
 
-static int cmd_del_domain(const char *domain)
+static int cmd_del_domain(const char *domain, const char *file)
 {
+    char norm[256];
+    normalize_domain(domain, norm, sizeof(norm));
+    if (norm[0] == '\0') {
+        fprintf(stderr, "Error: Invalid domain name '%s'\n", domain);
+        return 1;
+    }
+
     int fd = bpf_open_map("xdns_whitelist");
     if (fd < 0) {
         perror("Failed to open xdns_whitelist map");
         return 1;
     }
-    __u64 hash = xdns_hash_domain(domain);
+    __u64 hash = xdns_hash_domain(norm);
     if (bpf_map_delete(fd, &hash) < 0) {
-        perror("Failed to delete from whitelist map");
-        close(fd);
-        return 1;
+        printf("Kernel: Domain '%s' was not active in whitelist map\n", norm);
+    } else {
+        printf("Kernel: Removed '%s' from active whitelist\n", norm);
     }
-    printf("Deleted domain '%s' from whitelist\n", domain);
     close(fd);
+
+    /* Remove from whitelist file */
+    const char *target_file = get_default_whitelist_path(file);
+    FILE *fp = fopen(target_file, "r");
+    if (fp) {
+        char temp_file[512];
+        snprintf(temp_file, sizeof(temp_file), "%s.tmp", target_file);
+        FILE *wfp = fopen(temp_file, "w");
+        if (wfp) {
+            char line[256];
+            int removed = 0;
+            while (fgets(line, sizeof(line), fp)) {
+                char existing[256];
+                normalize_domain(line, existing, sizeof(existing));
+                if (existing[0] != '\0' && strcasecmp(existing, norm) == 0) {
+                    removed = 1;
+                    continue;
+                }
+                fputs(line, wfp);
+            }
+            fclose(wfp);
+            fclose(fp);
+            if (removed) {
+                rename(temp_file, target_file);
+                printf("File  : Removed '%s' from %s\n", norm, target_file);
+            } else {
+                unlink(temp_file);
+                printf("File  : Domain '%s' was not found in %s\n", norm, target_file);
+            }
+        } else {
+            fclose(fp);
+        }
+    }
+
     return 0;
 }
 
@@ -428,9 +535,9 @@ int main(int argc, char **argv)
     }
 
     if (strcmp(argv[1], "add-domain") == 0 && argc >= 3) {
-        return cmd_add_domain(argv[2]);
+        return cmd_add_domain(argv[2], argc >= 4 ? argv[3] : NULL);
     } else if (strcmp(argv[1], "del-domain") == 0 && argc >= 3) {
-        return cmd_del_domain(argv[2]);
+        return cmd_del_domain(argv[2], argc >= 4 ? argv[3] : NULL);
     } else if (strcmp(argv[1], "list-whitelist") == 0 || strcmp(argv[1], "list-domains") == 0) {
         return cmd_list_whitelist(argc >= 3 ? argv[2] : NULL);
     } else if (strcmp(argv[1], "load-whitelist") == 0 && argc >= 3) {
