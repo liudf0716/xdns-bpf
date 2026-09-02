@@ -87,6 +87,7 @@ static void print_usage(const char *prog)
     printf("  list-whitelist [file]              List whitelisted domains and kernel map status\n");
     printf("  load-whitelist <file>              Batch load domain whitelist file\n");
     printf("  list-ips                           List dynamic hijacked IP set\n");
+    printf("  list-sessions                      List active transparent TCP proxy sessions\n");
     printf("  set-config <dns_ip:port> <tcp_ip:port> [enable:1|0]\n");
     printf("                                     Configure xkcptun redirect endpoints\n");
     printf("  stats                              Display interception statistics\n");
@@ -273,6 +274,62 @@ static int cmd_list_ips(void)
     return 0;
 }
 
+static int cmd_list_sessions(void)
+{
+    int fd = bpf_open_map("xdns_tcp_sessions");
+    if (fd < 0) {
+        perror("Failed to open xdns_tcp_sessions map");
+        return 1;
+    }
+
+    printf("%-24s %-24s %-12s\n", "Client Endpoint", "Original Target", "Last Seen");
+    printf("--------------------------------------------------------------------\n");
+
+    struct xdns_tcp_session_key key, next_key;
+    memset(&key, 0, sizeof(key));
+    memset(&next_key, 0, sizeof(next_key));
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    __u64 now_ns = (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    int count = 0;
+    int has_first = 0;
+    if (bpf_map_get_next_key(fd, NULL, &next_key) == 0) {
+        has_first = 1;
+        key = next_key;
+    }
+
+    while (has_first) {
+        struct xdns_tcp_session_val val;
+        if (bpf_map_lookup(fd, &key, &val) == 0) {
+            char cip[INET_ADDRSTRLEN], tip[INET_ADDRSTRLEN];
+            struct in_addr ca, ta;
+            ca.s_addr = key.client_ip;
+            ta.s_addr = val.orig_dst_ip;
+            inet_ntop(AF_INET, &ca, cip, sizeof(cip));
+            inet_ntop(AF_INET, &ta, tip, sizeof(tip));
+
+            char cstr[32], tstr[32];
+            snprintf(cstr, sizeof(cstr), "%s:%u", cip, ntohs(key.client_port));
+            snprintf(tstr, sizeof(tstr), "%s:%u", tip, ntohs(val.orig_dst_port));
+
+            unsigned long long age_sec = (now_ns > val.timestamp) ? (now_ns - val.timestamp) / 1000000000ULL : 0;
+            printf("%-24s %-24s %llus ago\n", cstr, tstr, age_sec);
+            count++;
+        }
+
+        if (bpf_map_get_next_key(fd, &key, &next_key) != 0)
+            break;
+        key = next_key;
+    }
+
+    close(fd);
+    printf("--------------------------------------------------------------------\n");
+    printf("Total active TCP sessions: %d\n", count);
+    return 0;
+}
+
 static int cmd_set_config(const char *dns_ep, const char *tcp_ep, int enabled)
 {
     int fd = bpf_open_map("xdns_config_map");
@@ -380,6 +437,8 @@ int main(int argc, char **argv)
         return cmd_load_whitelist(argv[2]);
     } else if (strcmp(argv[1], "list-ips") == 0) {
         return cmd_list_ips();
+    } else if (strcmp(argv[1], "list-sessions") == 0) {
+        return cmd_list_sessions();
     } else if (strcmp(argv[1], "set-config") == 0 && argc >= 4) {
         int enabled = (argc >= 5) ? atoi(argv[4]) : 1;
         return cmd_set_config(argv[2], argv[3], enabled);

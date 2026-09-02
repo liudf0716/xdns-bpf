@@ -20,6 +20,21 @@ struct xdns_session_val {
     __u64 timestamp;
 };
 
+/* Session tracking key for TCP transparent redirect */
+struct xdns_tcp_session_key {
+    __u32 client_ip;   /* Network byte order */
+    __u16 client_port; /* Network byte order */
+    __u16 pad;
+};
+
+/* Session tracking value for TCP transparent redirect */
+struct xdns_tcp_session_val {
+    __u32 orig_dst_ip;   /* Network byte order */
+    __u16 orig_dst_port; /* Network byte order */
+    __u16 pad;
+    __u64 timestamp;
+};
+
 /* Runtime configuration passed from userspace via Map */
 struct xdns_config {
     __u32 xkcp_dns_ip;    /* Network byte order, e.g. 127.0.0.1 */

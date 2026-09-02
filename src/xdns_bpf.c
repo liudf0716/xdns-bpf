@@ -35,6 +35,15 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_sessions SEC(".maps");
 
+/* TCP session map for transparent redirect and reverse-SNAT */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct xdns_tcp_session_key);
+    __type(value, struct xdns_tcp_session_val);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} xdns_tcp_sessions SEC(".maps");
+
 /* Resolved IP set: IPv4 (network byte order) -> expire timestamp (ns) */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -201,36 +210,59 @@ int tc_xdns_ingress(struct __sk_buff *skb)
         if ((void *)(tcp + 1) > data_end)
             return TC_ACT_UNSPEC;
 
-        /* Check if destination IP is in xdns_ip_set */
-        __u32 dst_ip = ip->daddr;
-        __u64 *expire_ts = bpf_map_lookup_elem(&xdns_ip_set, &dst_ip);
-        if (expire_ts) {
-            __u64 now = bpf_ktime_get_ns();
-            if (now < *expire_ts) {
-                if (stats) stats->tcp_redirected++;
+        struct xdns_tcp_session_key t_key = {
+            .client_ip = ip->saddr,
+            .client_port = tcp->source,
+            .pad = 0,
+        };
 
-                /* DNAT: Rewrite destination to xkcptun transparent proxy port */
-                __u32 old_daddr = ip->daddr;
-                __u32 new_daddr = cfg->xkcp_tcp_ip;
-                __u16 old_dport = tcp->dest;
-                __u16 new_dport = cfg->xkcp_tcp_port;
+        int redirect = 0;
+        struct xdns_tcp_session_val *existing = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
+        if (existing) {
+            redirect = 1;
+        } else {
+            /* Check if destination IP is in xdns_ip_set */
+            __u32 dst_ip = ip->daddr;
+            __u64 *expire_ts = bpf_map_lookup_elem(&xdns_ip_set, &dst_ip);
+            if (expire_ts) {
+                __u64 now = bpf_ktime_get_ns();
+                if (now < *expire_ts) {
+                    if (stats) stats->tcp_redirected++;
 
-                __u32 tcp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
-
-                ip->daddr = new_daddr;
-                tcp->dest = new_dport;
-
-                bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
-                                    old_daddr, new_daddr, 4);
-
-                bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
-                                    old_daddr, new_daddr, 4 | BPF_F_PSEUDO_HDR);
-                bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
-                                    old_dport, new_dport, 2);
-
-                /* Deliver to local stack */
-                return TC_ACT_OK;
+                    struct xdns_tcp_session_val t_val = {
+                        .orig_dst_ip = ip->daddr,
+                        .orig_dst_port = tcp->dest,
+                        .pad = 0,
+                        .timestamp = now,
+                    };
+                    bpf_map_update_elem(&xdns_tcp_sessions, &t_key, &t_val, BPF_ANY);
+                    redirect = 1;
+                }
             }
+        }
+
+        if (redirect) {
+            /* DNAT: Rewrite destination to xkcptun transparent proxy port */
+            __u32 old_daddr = ip->daddr;
+            __u32 new_daddr = cfg->xkcp_tcp_ip;
+            __u16 old_dport = tcp->dest;
+            __u16 new_dport = cfg->xkcp_tcp_port;
+
+            __u32 tcp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
+
+            ip->daddr = new_daddr;
+            tcp->dest = new_dport;
+
+            bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
+                                old_daddr, new_daddr, 4);
+
+            bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
+                                old_daddr, new_daddr, 4 | BPF_F_PSEUDO_HDR);
+            bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
+                                old_dport, new_dport, 2);
+
+            /* Deliver to local stack */
+            return TC_ACT_OK;
         }
     }
 
@@ -355,6 +387,49 @@ int tc_xdns_egress(struct __sk_buff *skb)
                                     old_sport, new_sport, 2);
 
                 bpf_map_delete_elem(&xdns_sessions, &s_key);
+                return TC_ACT_OK;
+            }
+        }
+    }
+
+    /* 2. Handle TCP traffic returning from xkcptun transparent proxy */
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)((char *)ip + (ip->ihl * 4));
+        if ((void *)(tcp + 1) > data_end)
+            return TC_ACT_UNSPEC;
+
+        /* Check if packet originated from xkcptun TCP redirect port */
+        if (ip->saddr == cfg->xkcp_tcp_ip && tcp->source == cfg->xkcp_tcp_port) {
+            struct xdns_tcp_session_key t_key = {
+                .client_ip = ip->daddr,
+                .client_port = tcp->dest,
+                .pad = 0,
+            };
+            struct xdns_tcp_session_val *t_val = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
+            if (t_val) {
+                __u32 old_saddr = ip->saddr;
+                __u32 new_saddr = t_val->orig_dst_ip;
+                __u16 old_sport = tcp->source;
+                __u16 new_sport = t_val->orig_dst_port;
+
+                __u32 tcp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
+                int is_closing = (tcp->fin || tcp->rst);
+
+                ip->saddr = new_saddr;
+                tcp->source = new_sport;
+
+                bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
+                                    old_saddr, new_saddr, 4);
+
+                bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
+                                    old_saddr, new_saddr, 4 | BPF_F_PSEUDO_HDR);
+                bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
+                                    old_sport, new_sport, 2);
+
+                if (is_closing) {
+                    bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
+                }
+
                 return TC_ACT_OK;
             }
         }
