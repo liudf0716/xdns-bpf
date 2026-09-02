@@ -36,8 +36,17 @@ start_service() {
 	# Ensure clsact qdisc exists
 	tc qdisc add dev "$ifname" clsact 2>/dev/null || true
 
-	# Attach xdns_bpf to ingress and egress at pref 1
-	# Non-whitelisted traffic returns TC_ACT_UNSPEC and falls through to pref 2 (aw-bpf)
+	# Check if aw-bpf is currently at pref 1 and chain it to pref 2
+	if tc filter show dev "$ifname" ingress pref 1 2>/dev/null | grep -q "aw-bpf"; then
+		tc filter del dev "$ifname" ingress pref 1 2>/dev/null || true
+		tc filter del dev "$ifname" egress pref 1 2>/dev/null || true
+		tc filter add dev "$ifname" ingress pref 2 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/ingress 2>/dev/null || true
+		tc filter add dev "$ifname" egress pref 2 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/egress 2>/dev/null || true
+		echo "Chained existing aw-bpf to pref 2"
+	fi
+
+	# Attach xdns_bpf at pref 1
+	# Non-whitelisted traffic returns TC_ACT_UNSPEC and cleanly falls through to pref 2 (aw-bpf)
 	tc filter replace dev "$ifname" ingress pref 1 handle 10 bpf da obj "$BPF_OBJ" sec classifier/ingress
 	tc filter replace dev "$ifname" egress pref 1 handle 10 bpf da obj "$BPF_OBJ" sec classifier/egress
 
@@ -56,5 +65,15 @@ stop_service() {
 	load_config
 	tc filter del dev "$ifname" ingress pref 1 2>/dev/null || true
 	tc filter del dev "$ifname" egress pref 1 2>/dev/null || true
+
+	# Move aw-bpf back to pref 1 if present at pref 2
+	if tc filter show dev "$ifname" ingress pref 2 2>/dev/null | grep -q "aw-bpf"; then
+		tc filter del dev "$ifname" ingress pref 2 2>/dev/null || true
+		tc filter del dev "$ifname" egress pref 2 2>/dev/null || true
+		tc filter add dev "$ifname" ingress pref 1 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/ingress 2>/dev/null || true
+		tc filter add dev "$ifname" egress pref 1 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/egress 2>/dev/null || true
+		echo "Restored aw-bpf to pref 1"
+	fi
+
 	echo "xdns-bpf stopped on $ifname"
 }

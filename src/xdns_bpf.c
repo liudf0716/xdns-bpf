@@ -63,79 +63,43 @@ struct dnshdr {
     __u16 arcount;
 } __attribute__((packed));
 
-static inline __u64 fnv1a_char(__u64 h, unsigned char c)
-{
-    if (c >= 'A' && c <= 'Z')
-        c += ('a' - 'A');
-    h ^= c;
-    h *= XDNS_FNV1A_64_PRIME;
-    return h;
-}
 
 /* Parse DNS QNAME from payload and test against whitelist */
-static inline int match_dns_qname(void *data, void *data_end, __u32 dns_offset)
+static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
 {
-    unsigned char *ptr = (unsigned char *)data + dns_offset + sizeof(struct dnshdr);
-    __u64 label_hashes[MAX_DNS_LABELS];
-    int label_count = 0;
+    unsigned char *ptr = (unsigned char *)data + udp_offset + sizeof(struct udphdr) + sizeof(struct dnshdr);
+    __u64 h = XDNS_FNV1A_64_OFFSET;
+    int started = 0;
 
-    for (int i = 0; i < MAX_DNS_LABELS; i++) {
-        label_hashes[i] = XDNS_FNV1A_64_OFFSET;
-    }
-
-    /* Iterate through QNAME labels (e.g. 6 google 3 com 0) */
+    /* Single linear scan of QNAME (up to 64 bytes) */
     #pragma unroll
-    for (int step = 0; step < 16; step++) {
+    for (int i = 0; i < 64; i++) {
         if ((void *)(ptr + 1) > data_end)
             return 0;
 
-        unsigned char len = *ptr;
+        unsigned char c = *ptr;
         ptr++;
 
-        if (len == 0) /* End of QNAME */
-            break;
-        if ((len & 0xC0) == 0xC0) /* Compression pointer not allowed in QNAME */
-            break;
-
-        /* If not the first label, add dot to existing hashes */
-        if (step > 0) {
-            for (int k = 0; k < MAX_DNS_LABELS; k++) {
-                if (k < label_count)
-                    label_hashes[k] = fnv1a_char(label_hashes[k], '.');
-            }
-        }
-
-        /* Register new label starting hash if slot available */
-        if (label_count < MAX_DNS_LABELS) {
-            label_hashes[label_count] = XDNS_FNV1A_64_OFFSET;
-            label_count++;
-        }
-
-        /* Read characters of label */
-        for (int j = 0; j < 32; j++) {
-            if (j >= len)
-                break;
-            if ((void *)(ptr + 1) > data_end)
-                return 0;
-
-            unsigned char c = *ptr;
-            ptr++;
-
-            for (int k = 0; k < MAX_DNS_LABELS; k++) {
-                if (k < label_count)
-                    label_hashes[k] = fnv1a_char(label_hashes[k], c);
-            }
-        }
-    }
-
-    /* Check if any suffix hash matches whitelist map */
-    for (int k = 0; k < MAX_DNS_LABELS; k++) {
-        if (k < label_count) {
-            __u64 h = label_hashes[k];
+        if (c == 0) {
+            /* End of QNAME: check if hash matches whitelist */
             __u8 *found = bpf_map_lookup_elem(&xdns_whitelist, &h);
-            if (found && *found == 1)
-                return 1;
+            return (found && *found == 1);
         }
+
+        if (c <= 63) {
+            if (started) {
+                /* Label boundary: convert to '.' */
+                c = '.';
+            } else {
+                started = 1;
+                continue;
+            }
+        } else if (c >= 'A' && c <= 'Z') {
+            c += ('a' - 'A');
+        }
+
+        h ^= c;
+        h *= XDNS_FNV1A_64_PRIME;
     }
 
     return 0;
@@ -204,15 +168,16 @@ int tc_xdns_ingress(struct __sk_buff *skb)
                     __u16 old_dport = udp->dest;
                     __u16 new_dport = cfg->xkcp_dns_port;
 
+                    ip->daddr = new_daddr;
+                    udp->dest = new_dport;
+
                     bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
                                         old_daddr, new_daddr, 4);
-                    ip->daddr = new_daddr;
 
                     bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                         old_daddr, new_daddr, 4 | BPF_F_PSEUDO_HDR);
                     bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                         old_dport, new_dport, 2);
-                    udp->dest = new_dport;
 
                     /* Deliver to local stack */
                     return TC_ACT_OK;
@@ -243,15 +208,16 @@ int tc_xdns_ingress(struct __sk_buff *skb)
 
                 __u32 tcp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
 
+                ip->daddr = new_daddr;
+                tcp->dest = new_dport;
+
                 bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
                                     old_daddr, new_daddr, 4);
-                ip->daddr = new_daddr;
 
                 bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
                                     old_daddr, new_daddr, 4 | BPF_F_PSEUDO_HDR);
                 bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
                                     old_dport, new_dport, 2);
-                tcp->dest = new_dport;
 
                 /* Deliver to local stack */
                 return TC_ACT_OK;
@@ -306,34 +272,49 @@ int tc_xdns_egress(struct __sk_buff *skb)
                 struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
                 if (stats) stats->dns_responses_parsed++;
 
-                /* Parse response answer: skip QNAME */
+                /* Parse response answer: skip Question QNAME */
                 unsigned char *ptr = (unsigned char *)dns + sizeof(struct dnshdr);
                 #pragma unroll
-                for (int step = 0; step < 32; step++) {
+                for (int step = 0; step < 64; step++) {
                     if ((void *)(ptr + 1) > data_end) break;
                     unsigned char l = *ptr;
                     ptr++;
                     if (l == 0) break;
                     if ((l & 0xC0) == 0xC0) {
-                        ptr++; /* Skip second byte of pointer */
+                        ptr++; /* pointer is 2 bytes total */
                         break;
                     }
-                    ptr += (l <= 32 ? l : 0);
                 }
                 /* Skip QTYPE (2) + QCLASS (2) */
                 ptr += 4;
 
-                /* Parse first Answer RR */
-                if ((void *)(ptr + sizeof(struct xdns_rr_hdr) + 4) <= data_end) {
-                    struct xdns_rr_hdr *rr = (void *)ptr;
-                    if (rr->type == bpf_htons(1) && rr->rdlength == bpf_htons(4)) { // Type A
-                        __u32 *ans_ip = (void *)(rr + 1);
-                        __u32 ttl_sec = bpf_ntohl(rr->ttl);
-                        if (ttl_sec < 60) ttl_sec = 60;
-                        if (ttl_sec > 86400) ttl_sec = 86400;
+                /* Parse Answer RR */
+                if ((void *)(ptr + 2) <= data_end) {
+                    unsigned char a0 = *ptr;
+                    if ((a0 & 0xC0) == 0xC0) {
+                        ptr += 2;
+                    } else {
+                        #pragma unroll
+                        for (int k = 0; k < 32; k++) {
+                            if ((void *)(ptr + 1) > data_end) break;
+                            if (*ptr == 0) { ptr++; break; }
+                            ptr++;
+                        }
+                    }
 
-                        __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
-                        bpf_map_update_elem(&xdns_ip_set, ans_ip, &expire_ts, BPF_ANY);
+                    /* Check RR: type(2) + class(2) + ttl(4) + rdlength(2) + ip(4) = 14 bytes */
+                    if ((void *)(ptr + 14) <= data_end) {
+                        __u16 atype = *(__u16 *)ptr;
+                        __u16 rdlen = *(__u16 *)(ptr + 8);
+                        if (atype == bpf_htons(1) && rdlen == bpf_htons(4)) {
+                            __u32 *ans_ip = (__u32 *)(ptr + 10);
+                            __u32 ttl_sec = bpf_ntohl(*(__u32 *)(ptr + 4));
+                            if (ttl_sec < 60) ttl_sec = 60;
+                            if (ttl_sec > 86400) ttl_sec = 86400;
+
+                            __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
+                            bpf_map_update_elem(&xdns_ip_set, ans_ip, &expire_ts, BPF_ANY);
+                        }
                     }
                 }
             }
@@ -353,15 +334,16 @@ int tc_xdns_egress(struct __sk_buff *skb)
 
                 __u32 udp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
 
+                ip->saddr = new_saddr;
+                udp->source = new_sport;
+
                 bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
                                     old_saddr, new_saddr, 4);
-                ip->saddr = new_saddr;
 
                 bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                     old_saddr, new_saddr, 4 | BPF_F_PSEUDO_HDR);
                 bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                     old_sport, new_sport, 2);
-                udp->source = new_sport;
 
                 bpf_map_delete_elem(&xdns_sessions, &s_key);
                 return TC_ACT_OK;
