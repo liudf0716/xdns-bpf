@@ -84,6 +84,7 @@ static void print_usage(const char *prog)
     printf("Commands:\n");
     printf("  add-domain <domain>                Add domain to whitelist\n");
     printf("  del-domain <domain>                Remove domain from whitelist\n");
+    printf("  list-whitelist [file]              List whitelisted domains and kernel map status\n");
     printf("  load-whitelist <file>              Batch load domain whitelist file\n");
     printf("  list-ips                           List dynamic hijacked IP set\n");
     printf("  set-config <dns_ip:port> <tcp_ip:port> [enable:1|0]\n");
@@ -165,6 +166,60 @@ static int cmd_load_whitelist(const char *file)
     fclose(fp);
     close(fd);
     printf("Successfully loaded %d domains into whitelist\n", count);
+    return 0;
+}
+
+static int cmd_list_whitelist(const char *file)
+{
+    const char *path = file ? file : "/etc/xdns/whitelist.txt";
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fp = fopen("whitelist.txt", "r");
+        if (!fp) {
+            fprintf(stderr, "Whitelist file not found: %s\n", path);
+            return 1;
+        }
+    }
+
+    int fd = bpf_open_map("xdns_whitelist");
+
+    printf("%-32s %-20s %-12s\n", "Domain", "FNV1a-64 Hash", "Kernel State");
+    printf("--------------------------------------------------------------------\n");
+
+    char line[256];
+    int count = 0;
+    int active_count = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
+        char *end = p + strlen(p) - 1;
+        while (end >= p && (*end == '\r' || *end == '\n' || *end == ' ' || *end == '\t')) {
+            *end = '\0';
+            end--;
+        }
+        if (strlen(p) == 0) continue;
+
+        __u64 hash = xdns_hash_domain(p);
+        const char *state = "Not Loaded";
+        if (fd >= 0) {
+            __u8 val = 0;
+            if (bpf_map_lookup(fd, &hash, &val) == 0 && val == 1) {
+                state = "Active";
+                active_count++;
+            }
+        } else {
+            state = "Map Unloaded";
+        }
+
+        printf("%-32s 0x%016llx   %-12s\n", p, (unsigned long long)hash, state);
+        count++;
+    }
+    fclose(fp);
+    if (fd >= 0) close(fd);
+
+    printf("--------------------------------------------------------------------\n");
+    printf("Total domains listed: %d (Active in kernel: %d)\n", count, active_count);
     return 0;
 }
 
@@ -319,6 +374,8 @@ int main(int argc, char **argv)
         return cmd_add_domain(argv[2]);
     } else if (strcmp(argv[1], "del-domain") == 0 && argc >= 3) {
         return cmd_del_domain(argv[2]);
+    } else if (strcmp(argv[1], "list-whitelist") == 0 || strcmp(argv[1], "list-domains") == 0) {
+        return cmd_list_whitelist(argc >= 3 ? argv[2] : NULL);
     } else if (strcmp(argv[1], "load-whitelist") == 0 && argc >= 3) {
         return cmd_load_whitelist(argv[2]);
     } else if (strcmp(argv[1], "list-ips") == 0) {
