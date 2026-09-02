@@ -1,0 +1,60 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2026 Dengfeng Liu
+# xdns-bpf service - manages xdns-bpf eBPF DNS interception and TCP proxy redirection
+
+START=92
+STOP=12
+USE_PROCD=1
+NAME=xdns
+
+BPF_OBJ="/usr/lib/bpf/xdns_bpf.o"
+CTL="/usr/bin/xdns-ctl"
+
+load_config() {
+	config_load xdns
+	config_get_bool enabled global enabled 1
+	config_get ifname global ifname "br-lan"
+	config_get xkcp_dns global xkcp_dns "127.0.0.1:5353"
+	config_get xkcp_tcp global xkcp_tcp "192.168.8.1:12345"
+	config_get whitelist_file global whitelist_file "/etc/xdns/whitelist.txt"
+}
+
+start_service() {
+	load_config
+	[ "$enabled" -eq 1 ] || return 0
+
+	[ -f "$BPF_OBJ" ] || {
+		echo "xdns_bpf.o not found at $BPF_OBJ" >&2
+		return 1
+	}
+
+	[ -e "/sys/class/net/$ifname" ] || {
+		echo "Interface $ifname does not exist" >&2
+		return 1
+	}
+
+	# Ensure clsact qdisc exists
+	tc qdisc add dev "$ifname" clsact 2>/dev/null || true
+
+	# Attach xdns_bpf to ingress and egress at pref 1
+	# Non-whitelisted traffic returns TC_ACT_UNSPEC and falls through to pref 2 (aw-bpf)
+	tc filter replace dev "$ifname" ingress pref 1 handle 10 bpf da obj "$BPF_OBJ" sec classifier/ingress
+	tc filter replace dev "$ifname" egress pref 1 handle 10 bpf da obj "$BPF_OBJ" sec classifier/egress
+
+	# Initialize runtime config map
+	$CTL set-config "$xkcp_dns" "$xkcp_tcp" 1
+
+	# Load domain whitelist
+	if [ -f "$whitelist_file" ]; then
+		$CTL load-whitelist "$whitelist_file"
+	fi
+
+	echo "xdns-bpf started on $ifname"
+}
+
+stop_service() {
+	load_config
+	tc filter del dev "$ifname" ingress pref 1 2>/dev/null || true
+	tc filter del dev "$ifname" egress pref 1 2>/dev/null || true
+	echo "xdns-bpf stopped on $ifname"
+}

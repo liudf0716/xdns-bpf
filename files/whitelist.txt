@@ -1,0 +1,26 @@
+# Default domain whitelist for xdns-bpf
+# Supports automatic subdomain wildcard matching (e.g. google.com matches *.google.com)
+
+github.com
+githubusercontent.com
+githubassets.com
+github.blog
+cloudflare.com
+google.com
+google.com.hk
+googlevideo.com
+youtube.com
+ytimg.com
+gvt1.com
+ggpht.com
+wikipedia.org
+wikimedia.org
+twitter.com
+x.com
+t.co
+telegram.org
+t.me
+openai.com
+chatgpt.com
+anthropic.com
+claude.ai
