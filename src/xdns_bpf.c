@@ -287,20 +287,19 @@ int tc_xdns_egress(struct __sk_buff *skb)
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_UNSPEC;
 
-    if (ip->protocol != IPPROTO_UDP)
-        return TC_ACT_UNSPEC;
-
-    struct udphdr *udp = (void *)((char *)ip + (ip->ihl * 4));
-    if ((void *)(udp + 1) > data_end)
-        return TC_ACT_UNSPEC;
-
     __u32 cfg_key = 0;
     struct xdns_config *cfg = bpf_map_lookup_elem(&xdns_config_map, &cfg_key);
     if (!cfg || cfg->enabled == 0)
         return TC_ACT_UNSPEC;
 
-    /* Check if packet is DNS response from xkcptun (source port 5353) */
-    if (udp->source == cfg->xkcp_dns_port) {
+    /* 1. Handle UDP DNS responses from xkcptun */
+    if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = (void *)((char *)ip + (ip->ihl * 4));
+        if ((void *)(udp + 1) > data_end)
+            return TC_ACT_UNSPEC;
+
+        /* Check if packet is DNS response from xkcptun (source port 5353) */
+        if (udp->source == cfg->xkcp_dns_port) {
         struct dnshdr *dns = (void *)((char *)udp + sizeof(struct udphdr));
         if ((void *)(dns + 1) > data_end)
             return TC_ACT_UNSPEC;
@@ -391,6 +390,7 @@ int tc_xdns_egress(struct __sk_buff *skb)
             }
         }
     }
+        }
 
     /* 2. Handle TCP traffic returning from xkcptun transparent proxy */
     if (ip->protocol == IPPROTO_TCP) {
