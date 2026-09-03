@@ -420,9 +420,13 @@ int tc_xdns_egress(struct __sk_buff *skb)
                     __u16 atype = *(__u16 *)ptr;
                     __u32 attl = 0;
                     __builtin_memcpy(&attl, ptr + 4, 4);
-                    __u16 rdlen = bpf_ntohs(*(__u16 *)(ptr + 8));
-                    ptr += 10;
+                    __u16 raw_rdlen = 0;
+                    __builtin_memcpy(&raw_rdlen, ptr + 8, 2);
+                    __u32 rdlen = bpf_ntohs(raw_rdlen);
+                    rdlen &= 0xff;
+                    if (rdlen > 128) break;
 
+                    ptr += 10;
                     if ((void *)(ptr + rdlen) > data_end) break;
 
                     /* Type A (1) and IPv4 length 4 */
