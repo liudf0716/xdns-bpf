@@ -255,17 +255,11 @@ static int cmd_load_whitelist(const char *file)
     char line[256];
     int count = 0;
     while (fgets(line, sizeof(line), fp)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
-        char *end = p + strlen(p) - 1;
-        while (end >= p && (*end == '\r' || *end == '\n' || *end == ' ' || *end == '\t')) {
-            *end = '\0';
-            end--;
-        }
-        if (strlen(p) == 0) continue;
+        char norm[256];
+        normalize_domain(line, norm, sizeof(norm));
+        if (norm[0] == '\0') continue;
 
-        __u64 hash = xdns_hash_domain(p);
+        __u64 hash = xdns_hash_domain(norm);
         __u8 val = 1;
         if (bpf_map_update(fd, &hash, &val, BPF_ANY) == 0) {
             count++;
@@ -298,17 +292,11 @@ static int cmd_list_whitelist(const char *file)
     int count = 0;
     int active_count = 0;
     while (fgets(line, sizeof(line), fp)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
-        char *end = p + strlen(p) - 1;
-        while (end >= p && (*end == '\r' || *end == '\n' || *end == ' ' || *end == '\t')) {
-            *end = '\0';
-            end--;
-        }
-        if (strlen(p) == 0) continue;
+        char norm[256];
+        normalize_domain(line, norm, sizeof(norm));
+        if (norm[0] == '\0') continue;
 
-        __u64 hash = xdns_hash_domain(p);
+        __u64 hash = xdns_hash_domain(norm);
         const char *state = "Not Loaded";
         if (fd >= 0) {
             __u8 val = 0;
@@ -319,8 +307,7 @@ static int cmd_list_whitelist(const char *file)
         } else {
             state = "Map Unloaded";
         }
-
-        printf("%-32s 0x%016llx   %-12s\n", p, (unsigned long long)hash, state);
+        printf("%-32s 0x%016llx   %-12s\n", norm, (unsigned long long)hash, state);
         count++;
     }
     fclose(fp);
