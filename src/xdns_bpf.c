@@ -239,8 +239,8 @@ int tc_xdns_ingress(struct __sk_buff *skb)
                     bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                         old_dport, new_dport, 2);
 
-                    /* Deliver to local stack */
-                    return TC_ACT_OK;
+                    /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+                    return TC_ACT_UNSPEC;
                 }
             }
         }
@@ -303,8 +303,8 @@ int tc_xdns_ingress(struct __sk_buff *skb)
             bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
                                 old_dport, new_dport, 2);
 
-            /* Deliver to local stack */
-            return TC_ACT_OK;
+            /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+            return TC_ACT_UNSPEC;
         }
     }
 
@@ -428,7 +428,8 @@ int tc_xdns_egress(struct __sk_buff *skb)
                                     old_sport, new_sport, 2);
 
                 bpf_map_delete_elem(&xdns_sessions, &s_key);
-                return TC_ACT_OK;
+                /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+                return TC_ACT_UNSPEC;
             }
         }
     }
@@ -472,7 +473,8 @@ int tc_xdns_egress(struct __sk_buff *skb)
                     bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
                 }
 
-                return TC_ACT_OK;
+                /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+                return TC_ACT_UNSPEC;
             }
         }
     }

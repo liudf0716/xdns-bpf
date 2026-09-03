@@ -36,13 +36,17 @@ start_service() {
 	# Ensure clsact qdisc exists
 	tc qdisc add dev "$ifname" clsact 2>/dev/null || true
 
-	# Check if aw-bpf is currently at pref 1 and chain it to pref 2
-	if tc filter show dev "$ifname" ingress pref 1 2>/dev/null | grep -q "aw-bpf"; then
-		tc filter del dev "$ifname" ingress pref 1 2>/dev/null || true
-		tc filter del dev "$ifname" egress pref 1 2>/dev/null || true
-		tc filter add dev "$ifname" ingress pref 2 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/ingress 2>/dev/null || true
-		tc filter add dev "$ifname" egress pref 2 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/egress 2>/dev/null || true
-		echo "Chained existing aw-bpf to pref 2"
+	# Ensure aw-bpf is chained to pref 2 if present
+	if [ -f "/lib/bpf/aw-bpf.o" ]; then
+		if tc filter show dev "$ifname" ingress pref 1 2>/dev/null | grep -q "aw-bpf"; then
+			tc filter del dev "$ifname" ingress pref 1 2>/dev/null || true
+			tc filter del dev "$ifname" egress pref 1 2>/dev/null || true
+		fi
+		if ! tc filter show dev "$ifname" ingress pref 2 2>/dev/null | grep -q "aw-bpf"; then
+			tc filter add dev "$ifname" ingress pref 2 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/ingress 2>/dev/null || true
+			tc filter add dev "$ifname" egress pref 2 handle 1 bpf da obj /lib/bpf/aw-bpf.o sec tc/egress 2>/dev/null || true
+			echo "Chained aw-bpf to pref 2"
+		fi
 	fi
 
 	# Attach xdns_bpf at pref 1
