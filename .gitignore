@@ -1,0 +1,7 @@
+*.o
+*.so
+xdns-ctl
+xdns-ctl-*
+build/
+.cache/
+compile_commands.json
