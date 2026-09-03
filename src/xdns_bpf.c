@@ -431,6 +431,7 @@ int tc_xdns_egress(struct __sk_buff *skb)
 
                     /* Type A (1) and IPv4 length 4 */
                     if (atype == bpf_htons(1) && rdlen == 4) {
+                        if ((void *)(ptr + 4) > data_end) break;
                         __u32 ans_ip = 0;
                         __builtin_memcpy(&ans_ip, ptr, 4);
                         __u32 ttl_sec = bpf_ntohl(attl);
