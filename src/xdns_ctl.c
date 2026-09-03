@@ -82,10 +82,10 @@ static void print_usage(const char *prog)
     printf("xdns-ctl - Control CLI for xdns-bpf\n\n");
     printf("Usage: %s <command> [arguments]\n\n", prog);
     printf("Commands:\n");
-    printf("  add-domain <domain> [file]         Add domain to kernel and persistent whitelist\n");
-    printf("  del-domain <domain> [file]         Remove domain from kernel and whitelist file\n");
-    printf("  list-whitelist [file]              List whitelisted domains and kernel map status\n");
-    printf("  load-whitelist <file>              Batch load domain whitelist file\n");
+    printf("  add-domain <domain> [file]         Add domain to kernel and persistent proxy domains\n");
+    printf("  del-domain <domain> [file]         Remove domain from kernel and proxy domains file\n");
+    printf("  list-domains [file]                List proxy domains and kernel map status\n");
+    printf("  load-domains <file>                Batch load proxy domains file\n");
     printf("  list-ips                           List dynamic hijacked IP set\n");
     printf("  list-sessions                      List active transparent TCP proxy sessions\n");
     printf("  set-config <dns_ip:port> <tcp_ip:port> [enable:1|0]\n");
@@ -94,15 +94,15 @@ static void print_usage(const char *prog)
     printf("\n");
 }
 
-static const char *get_default_whitelist_path(const char *user_file)
+static const char *get_default_domains_path(const char *user_file)
 {
     if (user_file && user_file[0] != '\0')
         return user_file;
-    if (access("/etc/xdns/whitelist.txt", F_OK) == 0 || access("/etc/xdns", W_OK) == 0)
-        return "/etc/xdns/whitelist.txt";
-    if (access("files/whitelist.txt", F_OK) == 0)
-        return "files/whitelist.txt";
-    return "whitelist.txt";
+    if (access("/etc/xdns/proxy_domains.txt", F_OK) == 0 || access("/etc/xdns", W_OK) == 0)
+        return "/etc/xdns/proxy_domains.txt";
+    if (access("files/proxy_domains.txt", F_OK) == 0)
+        return "files/proxy_domains.txt";
+    return "proxy_domains.txt";
 }
 
 static void normalize_domain(const char *in, char *out, size_t maxlen)
@@ -131,15 +131,15 @@ static int cmd_add_domain(const char *domain, const char *file)
         return 1;
     }
 
-    int fd = bpf_open_map("xdns_whitelist");
+    int fd = bpf_open_map("xdns_domains");
     if (fd < 0) {
-        perror("Failed to open xdns_whitelist map");
+        perror("Failed to open xdns_domains map");
         return 1;
     }
     __u64 hash = xdns_hash_domain(norm);
     __u8 val = 1;
     if (bpf_map_update(fd, &hash, &val, BPF_ANY) < 0) {
-        perror("Failed to update whitelist map");
+        perror("Failed to update domains map");
         close(fd);
         return 1;
     }
@@ -147,8 +147,8 @@ static int cmd_add_domain(const char *domain, const char *file)
 
     printf("Kernel: Activated '%s' (hash: 0x%016llx)\n", norm, (unsigned long long)hash);
 
-    /* Persist to whitelist file */
-    const char *target_file = get_default_whitelist_path(file);
+    /* Persist to domains file */
+    const char *target_file = get_default_domains_path(file);
     int already_in_file = 0;
     FILE *fp = fopen(target_file, "r");
     if (fp) {
@@ -189,21 +189,21 @@ static int cmd_del_domain(const char *domain, const char *file)
         return 1;
     }
 
-    int fd = bpf_open_map("xdns_whitelist");
+    int fd = bpf_open_map("xdns_domains");
     if (fd < 0) {
-        perror("Failed to open xdns_whitelist map");
+        perror("Failed to open xdns_domains map");
         return 1;
     }
     __u64 hash = xdns_hash_domain(norm);
     if (bpf_map_delete(fd, &hash) < 0) {
-        printf("Kernel: Domain '%s' was not active in whitelist map\n", norm);
+        printf("Kernel: Domain '%s' was not active in domains map\n", norm);
     } else {
-        printf("Kernel: Removed '%s' from active whitelist\n", norm);
+        printf("Kernel: Removed '%s' from active domains\n", norm);
     }
     close(fd);
 
-    /* Remove from whitelist file */
-    const char *target_file = get_default_whitelist_path(file);
+    /* Remove from domains file */
+    const char *target_file = get_default_domains_path(file);
     FILE *fp = fopen(target_file, "r");
     if (fp) {
         char temp_file[512];
@@ -238,16 +238,16 @@ static int cmd_del_domain(const char *domain, const char *file)
     return 0;
 }
 
-static int cmd_load_whitelist(const char *file)
+static int cmd_load_domains(const char *file)
 {
     FILE *fp = fopen(file, "r");
     if (!fp) {
-        perror("Failed to open whitelist file");
+        perror("Failed to open domains file");
         return 1;
     }
-    int fd = bpf_open_map("xdns_whitelist");
+    int fd = bpf_open_map("xdns_domains");
     if (fd < 0) {
-        perror("Failed to open xdns_whitelist map");
+        perror("Failed to open xdns_domains map");
         fclose(fp);
         return 1;
     }
@@ -267,23 +267,20 @@ static int cmd_load_whitelist(const char *file)
     }
     fclose(fp);
     close(fd);
-    printf("Successfully loaded %d domains into whitelist\n", count);
+    printf("Successfully loaded %d domains into proxy domain list\n", count);
     return 0;
 }
 
-static int cmd_list_whitelist(const char *file)
+static int cmd_list_domains(const char *file)
 {
-    const char *path = file ? file : "/etc/xdns/whitelist.txt";
+    const char *path = file ? file : get_default_domains_path(NULL);
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        fp = fopen("whitelist.txt", "r");
-        if (!fp) {
-            fprintf(stderr, "Whitelist file not found: %s\n", path);
-            return 1;
-        }
+        fprintf(stderr, "Domains file not found: %s\n", path);
+        return 1;
     }
 
-    int fd = bpf_open_map("xdns_whitelist");
+    int fd = bpf_open_map("xdns_domains");
 
     printf("%-32s %-20s %-12s\n", "Domain", "FNV1a-64 Hash", "Kernel State");
     printf("--------------------------------------------------------------------\n");
@@ -498,7 +495,7 @@ static int cmd_stats(void)
     memset(&total, 0, sizeof(total));
     for (int i = 0; i < ncpus; i++) {
         total.dns_queries_total += stats_arr[i].dns_queries_total;
-        total.dns_queries_hijacked += stats_arr[i].dns_queries_hijacked;
+        total.dns_queries_proxied += stats_arr[i].dns_queries_proxied;
         total.dns_responses_parsed += stats_arr[i].dns_responses_parsed;
         total.tcp_redirected += stats_arr[i].tcp_redirected;
     }
@@ -507,7 +504,7 @@ static int cmd_stats(void)
 
     printf("================ xdns-bpf Statistics ================\n");
     printf("  DNS Queries Intercepted  : %llu\n", (unsigned long long)total.dns_queries_total);
-    printf("  DNS Whitelist Hijacked   : %llu\n", (unsigned long long)total.dns_queries_hijacked);
+    printf("  DNS Queries Proxied      : %llu\n", (unsigned long long)total.dns_queries_proxied);
     printf("  DNS Responses Learned    : %llu\n", (unsigned long long)total.dns_responses_parsed);
     printf("  TCP Connections Proxied  : %llu\n", (unsigned long long)total.tcp_redirected);
     printf("======================================================\n");
@@ -521,14 +518,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (strcmp(argv[1], "add-domain") == 0 && argc >= 3) {
+    if ((strcmp(argv[1], "add-domain") == 0 || strcmp(argv[1], "add-proxy-domain") == 0) && argc >= 3) {
         return cmd_add_domain(argv[2], argc >= 4 ? argv[3] : NULL);
-    } else if (strcmp(argv[1], "del-domain") == 0 && argc >= 3) {
+    } else if ((strcmp(argv[1], "del-domain") == 0 || strcmp(argv[1], "del-proxy-domain") == 0) && argc >= 3) {
         return cmd_del_domain(argv[2], argc >= 4 ? argv[3] : NULL);
-    } else if (strcmp(argv[1], "list-whitelist") == 0 || strcmp(argv[1], "list-domains") == 0) {
-        return cmd_list_whitelist(argc >= 3 ? argv[2] : NULL);
-    } else if (strcmp(argv[1], "load-whitelist") == 0 && argc >= 3) {
-        return cmd_load_whitelist(argv[2]);
+    } else if (strcmp(argv[1], "list-domains") == 0 || strcmp(argv[1], "list-whitelist") == 0) {
+        return cmd_list_domains(argc >= 3 ? argv[2] : NULL);
+    } else if ((strcmp(argv[1], "load-domains") == 0 || strcmp(argv[1], "load-whitelist") == 0) && argc >= 3) {
+        return cmd_load_domains(argv[2]);
     } else if (strcmp(argv[1], "list-ips") == 0) {
         return cmd_list_ips();
     } else if (strcmp(argv[1], "list-sessions") == 0) {

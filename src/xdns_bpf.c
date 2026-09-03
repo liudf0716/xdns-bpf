@@ -17,14 +17,14 @@
 #define MAX_DNS_NAME_LEN 128
 #define MAX_DNS_LABELS   8
 
-/* Whitelist map: 64-bit domain hash -> 1 */
+/* Domain proxy map: 64-bit domain hash -> 1 */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
     __type(value, __u8);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-} xdns_whitelist SEC(".maps");
+} xdns_domains SEC(".maps");
 
 /* DNS session map for reverse-SNAT */
 struct {
@@ -82,7 +82,7 @@ struct dnshdr {
 } __attribute__((packed));
 
 
-/* Parse DNS QNAME from payload and test against whitelist (supports wildcard subdomains) */
+/* Parse DNS QNAME from payload and test against proxy domains (supports 4 levels of wildcard subdomains) */
 static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
 {
     unsigned char *ptr = (unsigned char *)data + udp_offset + sizeof(struct udphdr) + sizeof(struct dnshdr);
@@ -90,11 +90,12 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
     __u64 h_sub1 = 0;
     __u64 h_sub2 = 0;
     __u64 h_sub3 = 0;
+    __u64 h_sub4 = 0;
     int started = 0;
 
-    /* Single linear scan of QNAME (up to 64 bytes) */
+    /* Single linear scan of QNAME (up to 128 bytes) */
     #pragma unroll
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 128; i++) {
         if ((void *)(ptr + 1) > data_end)
             return 0;
 
@@ -102,20 +103,24 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
         ptr++;
 
         if (c == 0) {
-            /* End of QNAME: check full domain and parent domains against whitelist */
-            __u8 *found = bpf_map_lookup_elem(&xdns_whitelist, &h_full);
+            /* End of QNAME: check full domain and parent subdomains */
+            __u8 *found = bpf_map_lookup_elem(&xdns_domains, &h_full);
             if (found && *found == 1) return 1;
 
             if (h_sub2) {
-                found = bpf_map_lookup_elem(&xdns_whitelist, &h_sub2);
+                found = bpf_map_lookup_elem(&xdns_domains, &h_sub2);
                 if (found && *found == 1) return 1;
             }
             if (h_sub3) {
-                found = bpf_map_lookup_elem(&xdns_whitelist, &h_sub3);
+                found = bpf_map_lookup_elem(&xdns_domains, &h_sub3);
+                if (found && *found == 1) return 1;
+            }
+            if (h_sub4) {
+                found = bpf_map_lookup_elem(&xdns_domains, &h_sub4);
                 if (found && *found == 1) return 1;
             }
             if (h_sub1) {
-                found = bpf_map_lookup_elem(&xdns_whitelist, &h_sub1);
+                found = bpf_map_lookup_elem(&xdns_domains, &h_sub1);
                 if (found && *found == 1) return 1;
             }
             return 0;
@@ -126,6 +131,7 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
                 started = 1;
                 continue;
             }
+            h_sub4 = h_sub3;
             h_sub3 = h_sub2;
             h_sub2 = h_sub1;
             h_sub1 = XDNS_FNV1A_64_OFFSET;
@@ -146,6 +152,10 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
                 h_sub3 ^= c;
                 h_sub3 *= XDNS_FNV1A_64_PRIME;
             }
+            if (h_sub4 && h_sub4 != XDNS_FNV1A_64_OFFSET) {
+                h_sub4 ^= c;
+                h_sub4 *= XDNS_FNV1A_64_PRIME;
+            }
         } else {
             if (h_sub1) {
                 h_sub1 ^= c;
@@ -158,6 +168,10 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
             if (h_sub3) {
                 h_sub3 ^= c;
                 h_sub3 *= XDNS_FNV1A_64_PRIME;
+            }
+            if (h_sub4) {
+                h_sub4 ^= c;
+                h_sub4 *= XDNS_FNV1A_64_PRIME;
             }
         }
     }
@@ -207,7 +221,7 @@ int tc_xdns_ingress(struct __sk_buff *skb)
             /* Check QR == 0 (Query) and QDCOUNT > 0 */
             if ((bpf_ntohs(dns->flags) & 0x8000) == 0 && bpf_ntohs(dns->qdcount) > 0) {
                 if (match_dns_qname(data, data_end, udp_offset)) {
-                    if (stats) stats->dns_queries_hijacked++;
+                    if (stats) stats->dns_queries_proxied++;
 
                     /* Record session for reverse-SNAT */
                     struct xdns_session_key s_key = {
@@ -246,7 +260,7 @@ int tc_xdns_ingress(struct __sk_buff *skb)
         }
     }
 
-    /* 2. Handle TCP traffic for whitelisted IPs */
+    /* 2. Handle TCP traffic for proxied target IPs */
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)((char *)ip + (ip->ihl * 4));
         if ((void *)(tcp + 1) > data_end)
@@ -258,27 +272,42 @@ int tc_xdns_ingress(struct __sk_buff *skb)
             .pad = 0,
         };
 
+        int is_syn = (tcp->syn && !tcp->ack);
+        int is_rst = tcp->rst;
         int redirect = 0;
-        struct xdns_tcp_session_val *existing = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
-        if (existing) {
-            redirect = 1;
-        } else {
-            /* Check if destination IP is in xdns_ip_set */
+
+        if (is_syn) {
+            /* A pure SYN packet indicates a brand-new TCP connection.
+             * Always verify destination IP against dynamic xdns_ip_set.
+             */
             __u32 dst_ip = ip->daddr;
             __u64 *expire_ts = bpf_map_lookup_elem(&xdns_ip_set, &dst_ip);
-            if (expire_ts) {
-                __u64 now = bpf_ktime_get_ns();
-                if (now < *expire_ts) {
-                    if (stats) stats->tcp_redirected++;
+            __u64 now = bpf_ktime_get_ns();
 
-                    struct xdns_tcp_session_val t_val = {
-                        .orig_dst_ip = ip->daddr,
-                        .orig_dst_port = tcp->dest,
-                        .pad = 0,
-                        .timestamp = now,
-                    };
-                    bpf_map_update_elem(&xdns_tcp_sessions, &t_key, &t_val, BPF_ANY);
-                    redirect = 1;
+            if (expire_ts && now < *expire_ts) {
+                if (stats) stats->tcp_redirected++;
+
+                struct xdns_tcp_session_val t_val = {
+                    .orig_dst_ip = ip->daddr,
+                    .orig_dst_port = tcp->dest,
+                    .pad = 0,
+                    .timestamp = now,
+                };
+                bpf_map_update_elem(&xdns_tcp_sessions, &t_key, &t_val, BPF_ANY);
+                redirect = 1;
+            } else {
+                /* New connection to non-proxied IP: clear any stale session
+                 * lingering on this reused client ephemeral port.
+                 */
+                bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
+            }
+        } else {
+            /* Established packet: verify session matches exact original destination */
+            struct xdns_tcp_session_val *existing = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
+            if (existing && existing->orig_dst_ip == ip->daddr && existing->orig_dst_port == tcp->dest) {
+                redirect = 1;
+                if (is_rst) {
+                    bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
                 }
             }
         }
@@ -370,34 +399,46 @@ int tc_xdns_egress(struct __sk_buff *skb)
                 /* Skip QTYPE (2) + QCLASS (2) */
                 ptr += 4;
 
-                /* Parse Answer RR */
-                if ((void *)(ptr + 2) <= data_end) {
+                /* Parse Answer RRs in loop (up to 4 answers) to support CNAME chains and multi-A records */
+                for (int a = 0; a < 4; a++) {
+                    if (a >= ancount) break;
+                    if ((void *)(ptr + 2) > data_end) break;
+
+                    /* Skip Answer NAME: standard compression pointer (0xC0xx) or root */
                     unsigned char a0 = *ptr;
                     if ((a0 & 0xC0) == 0xC0) {
                         ptr += 2;
+                    } else if (a0 == 0) {
+                        ptr += 1;
                     } else {
-                        #pragma unroll
-                        for (int k = 0; k < 32; k++) {
-                            if ((void *)(ptr + 1) > data_end) break;
-                            if (*ptr == 0) { ptr++; break; }
-                            ptr++;
-                        }
+                        break;
                     }
 
-                    /* Check RR: type(2) + class(2) + ttl(4) + rdlength(2) + ip(4) = 14 bytes */
-                    if ((void *)(ptr + 14) <= data_end) {
-                        __u16 atype = *(__u16 *)ptr;
-                        __u16 rdlen = *(__u16 *)(ptr + 8);
-                        if (atype == bpf_htons(1) && rdlen == bpf_htons(4)) {
-                            __u32 *ans_ip = (__u32 *)(ptr + 10);
-                            __u32 ttl_sec = bpf_ntohl(*(__u32 *)(ptr + 4));
-                            if (ttl_sec < 60) ttl_sec = 60;
-                            if (ttl_sec > 86400) ttl_sec = 86400;
+                    /* Require type(2) + class(2) + ttl(4) + rdlength(2) = 10 bytes */
+                    if ((void *)(ptr + 10) > data_end) break;
 
-                            __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
-                            bpf_map_update_elem(&xdns_ip_set, ans_ip, &expire_ts, BPF_ANY);
-                        }
+                    __u16 atype = *(__u16 *)ptr;
+                    __u32 attl = 0;
+                    __builtin_memcpy(&attl, ptr + 4, 4);
+                    __u16 rdlen = bpf_ntohs(*(__u16 *)(ptr + 8));
+                    ptr += 10;
+
+                    if ((void *)(ptr + rdlen) > data_end) break;
+
+                    /* Type A (1) and IPv4 length 4 */
+                    if (atype == bpf_htons(1) && rdlen == 4) {
+                        __u32 ans_ip = 0;
+                        __builtin_memcpy(&ans_ip, ptr, 4);
+                        __u32 ttl_sec = bpf_ntohl(attl);
+                        if (ttl_sec < 60) ttl_sec = 60;
+                        if (ttl_sec > 86400) ttl_sec = 86400;
+
+                        __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
+                        bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY);
                     }
+
+                    /* Advance pointer to next RR (handles both CNAME and A records) */
+                    ptr += rdlen;
                 }
             }
 

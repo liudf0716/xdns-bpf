@@ -16,7 +16,7 @@ load_config() {
 	config_get ifname global ifname "br-lan"
 	config_get xkcp_dns global xkcp_dns "127.0.0.1:5353"
 	config_get xkcp_tcp global xkcp_tcp "192.168.8.1:12345"
-	config_get whitelist_file global whitelist_file "/etc/xdns/whitelist.txt"
+	config_get proxy_domains_file global proxy_domains_file "/etc/xdns/proxy_domains.txt"
 }
 
 start_service() {
@@ -50,16 +50,16 @@ start_service() {
 	fi
 
 	# Attach xdns_bpf at pref 1
-	# Non-whitelisted traffic returns TC_ACT_UNSPEC and cleanly falls through to pref 2 (aw-bpf)
+	# Non-proxied traffic returns TC_ACT_UNSPEC and cleanly falls through to pref 2 (aw-bpf)
 	tc filter replace dev "$ifname" ingress pref 1 handle 10 bpf da obj "$BPF_OBJ" sec classifier/ingress
 	tc filter replace dev "$ifname" egress pref 1 handle 10 bpf da obj "$BPF_OBJ" sec classifier/egress
 
 	# Initialize runtime config map
 	$CTL set-config "$xkcp_dns" "$xkcp_tcp" 1
 
-	# Load domain whitelist
-	if [ -f "$whitelist_file" ]; then
-		$CTL load-whitelist "$whitelist_file"
+	# Load proxy domains
+	if [ -f "$proxy_domains_file" ]; then
+		$CTL load-domains "$proxy_domains_file"
 	fi
 
 	echo "xdns-bpf started on $ifname"

@@ -47,7 +47,7 @@ struct xdns_config {
 /* Operational statistics */
 struct xdns_stats {
     __u64 dns_queries_total;
-    __u64 dns_queries_hijacked;
+    __u64 dns_queries_proxied;
     __u64 dns_responses_parsed;
     __u64 tcp_redirected;
 };
