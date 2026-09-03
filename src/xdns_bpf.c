@@ -422,18 +422,13 @@ int tc_xdns_egress(struct __sk_buff *skb)
                     __builtin_memcpy(&attl, ptr + 4, 4);
                     __u16 raw_rdlen = 0;
                     __builtin_memcpy(&raw_rdlen, ptr + 8, 2);
-                    __u32 rdlen = bpf_ntohs(raw_rdlen);
-                    rdlen &= 0xff;
-                    if (rdlen > 128) break;
-
-                    ptr += 10;
-                    if ((void *)(ptr + rdlen) > data_end) break;
+                    __u16 rdlen = bpf_ntohs(raw_rdlen);
 
                     /* Type A (1) and IPv4 length 4 */
                     if (atype == bpf_htons(1) && rdlen == 4) {
-                        if ((void *)(ptr + 4) > data_end) break;
+                        if ((void *)(ptr + 14) > data_end) break;
                         __u32 ans_ip = 0;
-                        __builtin_memcpy(&ans_ip, ptr, 4);
+                        __builtin_memcpy(&ans_ip, ptr + 10, 4);
                         __u32 ttl_sec = bpf_ntohl(attl);
                         if (ttl_sec < 60) ttl_sec = 60;
                         if (ttl_sec > 86400) ttl_sec = 86400;
@@ -443,7 +438,10 @@ int tc_xdns_egress(struct __sk_buff *skb)
                     }
 
                     /* Advance pointer to next RR (handles both CNAME and A records) */
-                    ptr += rdlen;
+                    if (rdlen > 128) break;
+                    ptr += 10;
+                    ptr += (rdlen & 0x7f);
+                    if ((void *)ptr > data_end) break;
                 }
             }
 
