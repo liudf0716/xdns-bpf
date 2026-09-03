@@ -75,11 +75,17 @@ xdns-ctl del-domain github.com
 # List proxy domains and their active kernel status
 xdns-ctl list-domains
 
-# Batch load domains from file
+# Batch load domains from file (additive; does not remove stale kernel entries)
 xdns-ctl load-domains /etc/xdns/proxy_domains.txt
+
+# Replace kernel domain map from file and clear all learned IPs
+xdns-ctl reload-domains /etc/xdns/proxy_domains.txt
 
 # List currently learned dynamic hijacked IP set and TTLs
 xdns-ctl list-ips
+
+# Drop all learned IPs (stops steering until DNS is learned again)
+xdns-ctl clear-ips
 
 # List active transparent TCP proxy sessions
 xdns-ctl list-sessions

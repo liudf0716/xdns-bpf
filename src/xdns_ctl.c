@@ -85,8 +85,10 @@ static void print_usage(const char *prog)
     printf("  add-domain <domain> [file]         Add domain to kernel and persistent proxy domains\n");
     printf("  del-domain <domain> [file]         Remove domain from kernel and proxy domains file\n");
     printf("  list-domains [file]                List proxy domains and kernel map status\n");
-    printf("  load-domains <file>                Batch load proxy domains file\n");
+    printf("  load-domains <file>                Batch load proxy domains file (additive)\n");
+    printf("  reload-domains [file]              Replace kernel domains from file and clear resolved IPs\n");
     printf("  list-ips                           List dynamic hijacked IP set\n");
+    printf("  clear-ips                          Clear all resolved IPs from kernel map\n");
     printf("  list-sessions                      List active transparent TCP proxy sessions\n");
     printf("  set-config <dns_ip:port> <tcp_ip:port> [enable:1|0]\n");
     printf("                                     Configure xkcptun redirect endpoints\n");
@@ -238,17 +240,26 @@ static int cmd_del_domain(const char *domain, const char *file)
     return 0;
 }
 
-static int cmd_load_domains(const char *file)
+/* Delete every remaining element. Passing NULL as current key always yields
+ * the first key still present, which is the safe pattern while deleting. */
+static int bpf_map_clear(int fd, void *key, size_t key_size)
+{
+    int deleted = 0;
+
+    while (bpf_map_get_next_key(fd, NULL, key) == 0) {
+        if (bpf_map_delete(fd, key) != 0)
+            return -1;
+        deleted++;
+        memset(key, 0, key_size);
+    }
+    return deleted;
+}
+
+static int cmd_load_domains_into(int fd, const char *file, int *loaded)
 {
     FILE *fp = fopen(file, "r");
     if (!fp) {
         perror("Failed to open domains file");
-        return 1;
-    }
-    int fd = bpf_open_map("xdns_domains");
-    if (fd < 0) {
-        perror("Failed to open xdns_domains map");
-        fclose(fp);
         return 1;
     }
 
@@ -261,14 +272,82 @@ static int cmd_load_domains(const char *file)
 
         __u64 hash = xdns_hash_domain(norm);
         __u8 val = 1;
-        if (bpf_map_update(fd, &hash, &val, BPF_ANY) == 0) {
+        if (bpf_map_update(fd, &hash, &val, BPF_ANY) == 0)
             count++;
-        }
     }
     fclose(fp);
+    if (loaded)
+        *loaded = count;
+    return 0;
+}
+
+static int cmd_load_domains(const char *file)
+{
+    int fd = bpf_open_map("xdns_domains");
+    if (fd < 0) {
+        perror("Failed to open xdns_domains map");
+        return 1;
+    }
+
+    int count = 0;
+    int rc = cmd_load_domains_into(fd, file, &count);
     close(fd);
+    if (rc != 0)
+        return rc;
+
     printf("Successfully loaded %d domains into proxy domain list\n", count);
     return 0;
+}
+
+static int cmd_clear_ips(void)
+{
+    int fd = bpf_open_map("xdns_ip_set");
+    if (fd < 0) {
+        perror("Failed to open xdns_ip_set map");
+        return 1;
+    }
+
+    __u32 key = 0;
+    int deleted = bpf_map_clear(fd, &key, sizeof(key));
+    close(fd);
+    if (deleted < 0) {
+        perror("Failed to clear xdns_ip_set");
+        return 1;
+    }
+
+    printf("Cleared %d resolved IPs from xdns_ip_set\n", deleted);
+    return 0;
+}
+
+static int cmd_reload_domains(const char *file)
+{
+    const char *path = get_default_domains_path(file);
+    int fd = bpf_open_map("xdns_domains");
+    if (fd < 0) {
+        perror("Failed to open xdns_domains map");
+        return 1;
+    }
+
+    __u64 dkey = 0;
+    int removed = bpf_map_clear(fd, &dkey, sizeof(dkey));
+    if (removed < 0) {
+        perror("Failed to clear xdns_domains");
+        close(fd);
+        return 1;
+    }
+
+    int loaded = 0;
+    int rc = cmd_load_domains_into(fd, path, &loaded);
+    close(fd);
+    if (rc != 0)
+        return rc;
+
+    printf("Kernel domains replaced from %s: removed %d, loaded %d\n",
+           path, removed, loaded);
+
+    /* Learned IPs belong to the previous domain set; drop them so traffic
+     * is not still steered until TTL expiry. */
+    return cmd_clear_ips();
 }
 
 static int cmd_list_domains(const char *file)
@@ -526,8 +605,12 @@ int main(int argc, char **argv)
         return cmd_list_domains(argc >= 3 ? argv[2] : NULL);
     } else if ((strcmp(argv[1], "load-domains") == 0 || strcmp(argv[1], "load-whitelist") == 0) && argc >= 3) {
         return cmd_load_domains(argv[2]);
+    } else if (strcmp(argv[1], "reload-domains") == 0) {
+        return cmd_reload_domains(argc >= 3 ? argv[2] : NULL);
     } else if (strcmp(argv[1], "list-ips") == 0) {
         return cmd_list_ips();
+    } else if (strcmp(argv[1], "clear-ips") == 0) {
+        return cmd_clear_ips();
     } else if (strcmp(argv[1], "list-sessions") == 0) {
         return cmd_list_sessions();
     } else if (strcmp(argv[1], "set-config") == 0 && argc >= 4) {
