@@ -82,20 +82,18 @@ struct dnshdr {
 } __attribute__((packed));
 
 
-/* Parse DNS QNAME from payload and test against proxy domains (supports 4 levels of wildcard subdomains) */
+/* Parse DNS QNAME from payload and test against proxy domains (supports 2 levels of wildcard subdomains) */
 static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
 {
     unsigned char *ptr = (unsigned char *)data + udp_offset + sizeof(struct udphdr) + sizeof(struct dnshdr);
     __u64 h_full = XDNS_FNV1A_64_OFFSET;
     __u64 h_sub1 = 0;
     __u64 h_sub2 = 0;
-    __u64 h_sub3 = 0;
-    __u64 h_sub4 = 0;
     int started = 0;
 
-    /* Single linear scan of QNAME (up to 128 bytes) */
+    /* Single linear scan of QNAME (up to 64 bytes) */
     #pragma unroll
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < 64; i++) {
         if ((void *)(ptr + 1) > data_end)
             return 0;
 
@@ -111,14 +109,6 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
                 found = bpf_map_lookup_elem(&xdns_domains, &h_sub2);
                 if (found && *found == 1) return 1;
             }
-            if (h_sub3) {
-                found = bpf_map_lookup_elem(&xdns_domains, &h_sub3);
-                if (found && *found == 1) return 1;
-            }
-            if (h_sub4) {
-                found = bpf_map_lookup_elem(&xdns_domains, &h_sub4);
-                if (found && *found == 1) return 1;
-            }
             if (h_sub1) {
                 found = bpf_map_lookup_elem(&xdns_domains, &h_sub1);
                 if (found && *found == 1) return 1;
@@ -131,8 +121,6 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
                 started = 1;
                 continue;
             }
-            h_sub4 = h_sub3;
-            h_sub3 = h_sub2;
             h_sub2 = h_sub1;
             h_sub1 = XDNS_FNV1A_64_OFFSET;
             c = '.';
@@ -148,14 +136,6 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
                 h_sub2 ^= c;
                 h_sub2 *= XDNS_FNV1A_64_PRIME;
             }
-            if (h_sub3 && h_sub3 != XDNS_FNV1A_64_OFFSET) {
-                h_sub3 ^= c;
-                h_sub3 *= XDNS_FNV1A_64_PRIME;
-            }
-            if (h_sub4 && h_sub4 != XDNS_FNV1A_64_OFFSET) {
-                h_sub4 ^= c;
-                h_sub4 *= XDNS_FNV1A_64_PRIME;
-            }
         } else {
             if (h_sub1) {
                 h_sub1 ^= c;
@@ -164,14 +144,6 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
             if (h_sub2) {
                 h_sub2 ^= c;
                 h_sub2 *= XDNS_FNV1A_64_PRIME;
-            }
-            if (h_sub3) {
-                h_sub3 ^= c;
-                h_sub3 *= XDNS_FNV1A_64_PRIME;
-            }
-            if (h_sub4) {
-                h_sub4 ^= c;
-                h_sub4 *= XDNS_FNV1A_64_PRIME;
             }
         }
     }
