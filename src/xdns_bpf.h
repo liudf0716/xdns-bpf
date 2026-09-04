@@ -35,6 +35,13 @@ struct xdns_tcp_session_val {
     __u64 timestamp;
 };
 
+/* Host socket cookie tracking value for connect4 -> sockops -> getsockopt */
+struct xdns_cookie_val {
+    __u32 orig_dst_ip;   /* Network byte order */
+    __u16 orig_dst_port; /* Network byte order */
+    __u16 pad;
+};
+
 /* Runtime configuration passed from userspace via Map */
 struct xdns_config {
     __u32 xkcp_dns_ip;    /* Network byte order, e.g. 127.0.0.1 */

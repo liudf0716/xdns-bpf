@@ -44,6 +44,15 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_tcp_sessions SEC(".maps");
 
+/* Socket cookie tracking map for Host mode transparent proxy */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, struct xdns_cookie_val);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} xdns_cookie_map SEC(".maps");
+
 /* Resolved IP set: IPv4 (network byte order) -> expire timestamp (ns) */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -516,7 +525,7 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
 #define XDNS_MODE_GATEWAY 0
 #endif
 
-SEC("classifier/ingress")
+SEC("tc/ingress")
 int tc_xdns_ingress(struct __sk_buff *skb)
 {
 #if XDNS_MODE_GATEWAY
@@ -526,7 +535,7 @@ int tc_xdns_ingress(struct __sk_buff *skb)
 #endif
 }
 
-SEC("classifier/egress")
+SEC("tc/egress")
 int tc_xdns_egress(struct __sk_buff *skb)
 {
 #if XDNS_MODE_GATEWAY
@@ -534,6 +543,141 @@ int tc_xdns_egress(struct __sk_buff *skb)
 #else
     return process_outbound(skb);
 #endif
+}
+
+#define SOL_IP 0
+#define SO_ORIGINAL_DST 80
+#define AF_INET 2
+
+/*
+ * Host Mode cgroup programs:
+ * Intercept connect(), track socket cookies upon establishment,
+ * and provide original destination via getsockopt(SO_ORIGINAL_DST).
+ */
+SEC("cgroup/connect4")
+int xdns_connect4(struct bpf_sock_addr *ctx)
+{
+    __u32 cfg_key = 0;
+    struct xdns_config *cfg = bpf_map_lookup_elem(&xdns_config_map, &cfg_key);
+    if (!cfg || cfg->enabled == 0)
+        return 1;
+
+    /* Handle UDP DNS connect redirect (optional for connected UDP sockets) */
+    if (ctx->protocol == IPPROTO_UDP && ctx->user_port == bpf_htons(53)) {
+        if (cfg->xkcp_dns_ip && cfg->xkcp_dns_port) {
+            ctx->user_ip4 = cfg->xkcp_dns_ip;
+            ctx->user_port = cfg->xkcp_dns_port;
+        }
+        return 1;
+    }
+
+    /* Handle TCP connections */
+    if (ctx->protocol == IPPROTO_TCP) {
+        __u32 dst_ip = ctx->user_ip4;
+        __u64 *expire_ts = bpf_map_lookup_elem(&xdns_ip_set, &dst_ip);
+        __u64 now = bpf_ktime_get_ns();
+
+        if (expire_ts && now < *expire_ts) {
+            __u64 cookie = bpf_get_socket_cookie(ctx);
+            struct xdns_cookie_val val = {
+                .orig_dst_ip = dst_ip,
+                .orig_dst_port = ctx->user_port,
+                .pad = 0,
+            };
+            bpf_map_update_elem(&xdns_cookie_map, &cookie, &val, BPF_ANY);
+
+            /* Redirect to configured transparent TCP proxy address */
+            ctx->user_ip4 = cfg->xkcp_tcp_ip;
+            ctx->user_port = cfg->xkcp_tcp_port;
+
+            __u32 stats_key = 0;
+            struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
+            if (stats) stats->tcp_redirected++;
+        }
+    }
+    return 1;
+}
+
+SEC("cgroup/sendmsg4")
+int xdns_sendmsg4(struct bpf_sock_addr *ctx)
+{
+    __u32 cfg_key = 0;
+    struct xdns_config *cfg = bpf_map_lookup_elem(&xdns_config_map, &cfg_key);
+    if (!cfg || cfg->enabled == 0)
+        return 1;
+
+    /* Intercept unconnected UDP DNS queries (standard getaddrinfo / musl / glibc) */
+    if (ctx->user_port == bpf_htons(53)) {
+        if (cfg->xkcp_dns_ip && cfg->xkcp_dns_port) {
+            ctx->user_ip4 = cfg->xkcp_dns_ip;
+            ctx->user_port = cfg->xkcp_dns_port;
+
+            __u32 stats_key = 0;
+            struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
+            if (stats) stats->dns_queries_proxied++;
+        }
+    }
+    return 1;
+}
+
+SEC("sockops")
+int xdns_sockops(struct bpf_sock_ops *skops)
+{
+    if (skops->op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
+        __u64 cookie = bpf_get_socket_cookie(skops);
+        struct xdns_cookie_val *val = bpf_map_lookup_elem(&xdns_cookie_map, &cookie);
+        if (val) {
+            /* skops->local_port is stored in host byte order */
+            struct xdns_tcp_session_key key = {
+                .client_ip = skops->local_ip4,
+                .client_port = bpf_htons((__u16)skops->local_port),
+                .pad = 0,
+            };
+            struct xdns_tcp_session_val sval = {
+                .orig_dst_ip = val->orig_dst_ip,
+                .orig_dst_port = val->orig_dst_port,
+                .pad = 0,
+                .timestamp = bpf_ktime_get_ns(),
+            };
+            bpf_map_update_elem(&xdns_tcp_sessions, &key, &sval, BPF_ANY);
+            bpf_map_delete_elem(&xdns_cookie_map, &cookie);
+        }
+    }
+    return 1;
+}
+
+SEC("cgroup/getsockopt")
+int xdns_getsockopt(struct bpf_sockopt *ctx)
+{
+    if (ctx->level == SOL_IP && ctx->optname == SO_ORIGINAL_DST) {
+        struct bpf_sock *sk = ctx->sk;
+        if (sk) {
+            /* Look up original destination using client endpoint */
+            struct xdns_tcp_session_key key = {
+                .client_ip = sk->dst_ip4,
+                .client_port = bpf_htons((__u16)sk->dst_port),
+                .pad = 0,
+            };
+            struct xdns_tcp_session_val *sval = bpf_map_lookup_elem(&xdns_tcp_sessions, &key);
+            if (!sval) {
+                key.client_port = (__u16)sk->dst_port;
+                sval = bpf_map_lookup_elem(&xdns_tcp_sessions, &key);
+            }
+
+            if (sval) {
+                struct sockaddr_in *sa = ctx->optval;
+                if ((void *)(sa + 1) <= ctx->optval_end) {
+                    sa->sin_family = AF_INET;
+                    sa->sin_port = sval->orig_dst_port;
+                    sa->sin_addr.s_addr = sval->orig_dst_ip;
+                    *(volatile int *)&ctx->optlen = sizeof(struct sockaddr_in);
+                    ctx->retval = 0;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 1;
 }
 
 char _license[] SEC("license") = "GPL";

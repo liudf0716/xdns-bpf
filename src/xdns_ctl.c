@@ -11,8 +11,9 @@
 #include "xdns_bpf.h"
 #include "xdns_hash.h"
 
-#define BPF_FS_TC_PATH "/sys/fs/bpf/tc/globals"
-#define BPF_FS_PATH    "/sys/fs/bpf"
+#define BPF_FS_HOST_PATH "/sys/fs/bpf"
+#define BPF_FS_TC_PATH   "/sys/fs/bpf/tc/globals"
+#define BPF_FS_PATH      "/sys/fs/bpf"
 
 static int bpf_sys(int cmd, union bpf_attr *attr)
 {
@@ -25,13 +26,19 @@ static int bpf_open_map(const char *name)
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
 
-    /* Try tc/globals first */
-    snprintf(path, sizeof(path), "%s/%s", BPF_FS_TC_PATH, name);
+    /* 1. Try host path (/sys/fs/bpf) first */
+    snprintf(path, sizeof(path), "%s/%s", BPF_FS_HOST_PATH, name);
     attr.pathname = (__u64)(long)path;
     int fd = bpf_sys(BPF_OBJ_GET, &attr);
     if (fd >= 0) return fd;
 
-    /* Fallback to root BPF FS */
+    /* 2. Try tc/globals next (gateway mode) */
+    snprintf(path, sizeof(path), "%s/%s", BPF_FS_TC_PATH, name);
+    attr.pathname = (__u64)(long)path;
+    fd = bpf_sys(BPF_OBJ_GET, &attr);
+    if (fd >= 0) return fd;
+
+    /* 3. Fallback to root BPF FS */
     snprintf(path, sizeof(path), "%s/%s", BPF_FS_PATH, name);
     attr.pathname = (__u64)(long)path;
     return bpf_sys(BPF_OBJ_GET, &attr);
@@ -92,6 +99,8 @@ static void print_usage(const char *prog)
     printf("  list-sessions                      List active transparent TCP proxy sessions\n");
     printf("  set-config <dns_ip:port> <tcp_ip:port> [enable:1|0]\n");
     printf("                                     Configure xkcptun redirect endpoints\n");
+    printf("  host-start [obj_file] [cgroup_dir] Start Host mode eBPF cgroup redirection\n");
+    printf("  host-stop [cgroup_dir]             Stop Host mode eBPF cgroup redirection\n");
     printf("  stats                              Display interception statistics\n");
     printf("\n");
 }
@@ -590,6 +599,90 @@ static int cmd_stats(void)
     return 0;
 }
 
+static const char *get_default_bpf_obj(const char *user_path)
+{
+    if (user_path && user_path[0] != '\0')
+        return user_path;
+    if (access("build/xdns_bpf.o", F_OK) == 0)
+        return "build/xdns_bpf.o";
+    if (access("xdns_bpf.o", F_OK) == 0)
+        return "xdns_bpf.o";
+    if (access("/usr/lib/bpf/xdns_bpf.o", F_OK) == 0)
+        return "/usr/lib/bpf/xdns_bpf.o";
+    return "xdns_bpf.o";
+}
+
+static int cmd_host_start(const char *user_obj, const char *user_cgroup)
+{
+    const char *obj = get_default_bpf_obj(user_obj);
+    const char *cg = (user_cgroup && user_cgroup[0]) ? user_cgroup : "/sys/fs/cgroup";
+
+    if (access(obj, F_OK) != 0) {
+        fprintf(stderr, "Error: BPF object file '%s' not found\n", obj);
+        return 1;
+    }
+    if (access(cg, F_OK) != 0) {
+        fprintf(stderr, "Error: cgroup path '%s' does not exist\n", cg);
+        return 1;
+    }
+
+    char cmd[512];
+    /* 1. Ensure pin directories exist */
+    system("mkdir -p /sys/fs/bpf/tc/globals /sys/fs/bpf 2>/dev/null");
+
+    /* 2. Load all programs from the BPF object and pin maps in /sys/fs/bpf/tc/globals */
+    snprintf(cmd, sizeof(cmd), "bpftool prog loadall \"%s\" /sys/fs/bpf pinmaps " BPF_FS_TC_PATH " 2>/dev/null || bpftool prog loadall \"%s\" /sys/fs/bpf", obj, obj);
+    int rc = system(cmd);
+    if (rc != 0) {
+        /* If already loaded, try using existing pinned programs */
+        if (access("/sys/fs/bpf/xdns_connect4", F_OK) != 0) {
+            fprintf(stderr, "Error: Failed to load BPF object '%s'\n", obj);
+            return 1;
+        }
+    }
+
+    /* 3. Attach programs to cgroup */
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup attach \"%s\" connect4 pinned /sys/fs/bpf/xdns_connect4 2>/dev/null", cg);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup attach \"%s\" sendmsg4 pinned /sys/fs/bpf/xdns_sendmsg4 2>/dev/null", cg);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup attach \"%s\" sock_ops pinned /sys/fs/bpf/xdns_sockops 2>/dev/null", cg);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup attach \"%s\" getsockopt pinned /sys/fs/bpf/xdns_getsockopt 2>/dev/null", cg);
+    system(cmd);
+
+    printf("xdns-bpf Host mode successfully attached to cgroup '%s'!\n", cg);
+    return 0;
+}
+
+static int cmd_host_stop(const char *user_cgroup)
+{
+    const char *cg = (user_cgroup && user_cgroup[0]) ? user_cgroup : "/sys/fs/cgroup";
+    char cmd[512];
+
+    /* 1. Detach programs from cgroup */
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup detach \"%s\" connect4 pinned /sys/fs/bpf/xdns_connect4 2>/dev/null", cg);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup detach \"%s\" sendmsg4 pinned /sys/fs/bpf/xdns_sendmsg4 2>/dev/null", cg);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup detach \"%s\" sock_ops pinned /sys/fs/bpf/xdns_sockops 2>/dev/null", cg);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "bpftool cgroup detach \"%s\" getsockopt pinned /sys/fs/bpf/xdns_getsockopt 2>/dev/null", cg);
+    system(cmd);
+
+    /* 2. Remove pinned host programs */
+    system("rm -f /sys/fs/bpf/xdns_connect4 /sys/fs/bpf/xdns_sendmsg4 /sys/fs/bpf/xdns_sockops /sys/fs/bpf/xdns_getsockopt /sys/fs/bpf/tc_xdns_* 2>/dev/null");
+
+    printf("xdns-bpf Host mode stopped and detached from '%s'.\n", cg);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -616,6 +709,10 @@ int main(int argc, char **argv)
     } else if (strcmp(argv[1], "set-config") == 0 && argc >= 4) {
         int enabled = (argc >= 5) ? atoi(argv[4]) : 1;
         return cmd_set_config(argv[2], argv[3], enabled);
+    } else if (strcmp(argv[1], "host-start") == 0) {
+        return cmd_host_start(argc >= 3 ? argv[2] : NULL, argc >= 4 ? argv[3] : NULL);
+    } else if (strcmp(argv[1], "host-stop") == 0) {
+        return cmd_host_stop(argc >= 3 ? argv[2] : NULL);
     } else if (strcmp(argv[1], "stats") == 0) {
         return cmd_stats();
     } else {
