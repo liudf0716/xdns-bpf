@@ -151,8 +151,12 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
     return 0;
 }
 
-SEC("classifier/ingress")
-int tc_xdns_ingress(struct __sk_buff *skb)
+/*
+ * Process outbound traffic (Client requests):
+ * - DNS query interception and DNAT redirect to xkcptun DNS port
+ * - TCP SYN interception and redirect to xkcptun transparent proxy port
+ */
+static __always_inline int process_outbound(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
@@ -225,7 +229,7 @@ int tc_xdns_ingress(struct __sk_buff *skb)
                     bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                         old_dport, new_dport, 2);
 
-                    /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+                    /* Cascade to downstream filter */
                     return TC_ACT_UNSPEC;
                 }
             }
@@ -304,17 +308,22 @@ int tc_xdns_ingress(struct __sk_buff *skb)
             bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
                                 old_dport, new_dport, 2);
 
-            /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+            /* Cascade to downstream filter */
             return TC_ACT_UNSPEC;
         }
     }
 
-    /* Fall through to next filter (pref 2: aw-bpf.o) */
+    /* Fall through to next filter */
     return TC_ACT_UNSPEC;
 }
 
-SEC("classifier/egress")
-int tc_xdns_egress(struct __sk_buff *skb)
+/*
+ * Process inbound traffic (Server/Tunnel responses):
+ * - Parse DNS response answers and cache resolved IPs into xdns_ip_set with TTL
+ * - Reverse-SNAT for DNS query replies
+ * - Reverse-SNAT for TCP proxy return packets
+ */
+static __always_inline int process_inbound(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
@@ -343,113 +352,113 @@ int tc_xdns_egress(struct __sk_buff *skb)
 
         /* Check if packet is DNS response from xkcptun (source port 5353) */
         if (udp->source == cfg->xkcp_dns_port) {
-        struct dnshdr *dns = (void *)((char *)udp + sizeof(struct udphdr));
-        if ((void *)(dns + 1) > data_end)
-            return TC_ACT_UNSPEC;
-
-        /* QR == 1 (Response) */
-        if ((bpf_ntohs(dns->flags) & 0x8000) != 0) {
-            __u16 ancount = bpf_ntohs(dns->ancount);
-            if (ancount > 0) {
-                __u32 stats_key = 0;
-                struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
-                if (stats) stats->dns_responses_parsed++;
-
-                /* Parse response answer: skip Question QNAME */
-                unsigned char *ptr = (unsigned char *)dns + sizeof(struct dnshdr);
-                #pragma unroll
-                for (int step = 0; step < 64; step++) {
-                    if ((void *)(ptr + 1) > data_end) break;
-                    unsigned char l = *ptr;
-                    ptr++;
-                    if (l == 0) break;
-                    if ((l & 0xC0) == 0xC0) {
-                        ptr++; /* pointer is 2 bytes total */
-                        break;
-                    }
-                }
-                /* Skip QTYPE (2) + QCLASS (2) */
-                ptr += 4;
-
-                /* Parse Answer RRs in loop (up to 4 answers) to support CNAME chains and multi-A records */
-                for (int a = 0; a < 4; a++) {
-                    if (a >= ancount) break;
-                    if ((void *)(ptr + 2) > data_end) break;
-
-                    /* Skip Answer NAME: standard compression pointer (0xC0xx) or root */
-                    unsigned char a0 = *ptr;
-                    if ((a0 & 0xC0) == 0xC0) {
-                        ptr += 2;
-                    } else if (a0 == 0) {
-                        ptr += 1;
-                    } else {
-                        break;
-                    }
-
-                    /* Require type(2) + class(2) + ttl(4) + rdlength(2) = 10 bytes */
-                    if ((void *)(ptr + 10) > data_end) break;
-
-                    __u16 atype = *(__u16 *)ptr;
-                    __u32 attl = 0;
-                    __builtin_memcpy(&attl, ptr + 4, 4);
-                    __u16 raw_rdlen = 0;
-                    __builtin_memcpy(&raw_rdlen, ptr + 8, 2);
-                    __u16 rdlen = bpf_ntohs(raw_rdlen);
-
-                    /* Type A (1) and IPv4 length 4 */
-                    if (atype == bpf_htons(1) && rdlen == 4) {
-                        if ((void *)(ptr + 14) > data_end) break;
-                        __u32 ans_ip = 0;
-                        __builtin_memcpy(&ans_ip, ptr + 10, 4);
-                        __u32 ttl_sec = bpf_ntohl(attl);
-                        if (ttl_sec < 60) ttl_sec = 60;
-                        if (ttl_sec > 86400) ttl_sec = 86400;
-
-                        __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
-                        bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY);
-                    }
-
-                    /* Advance pointer to next RR (handles both CNAME and A records) */
-                    if (rdlen > 128) break;
-                    ptr += 10;
-                    ptr += (rdlen & 0x7f);
-                    if ((void *)ptr > data_end) break;
-                }
-            }
-
-            /* Lookup session to reverse-SNAT */
-            struct xdns_session_key s_key = {
-                .client_ip = ip->daddr,
-                .client_port = udp->dest,
-                .tx_id = dns->id,
-            };
-            struct xdns_session_val *s_val = bpf_map_lookup_elem(&xdns_sessions, &s_key);
-            if (s_val) {
-                __u32 old_saddr = ip->saddr;
-                __u32 new_saddr = s_val->orig_dst_ip;
-                __u16 old_sport = udp->source;
-                __u16 new_sport = s_val->orig_dst_port;
-
-                __u32 udp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
-
-                ip->saddr = new_saddr;
-                udp->source = new_sport;
-
-                bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
-                                    old_saddr, new_saddr, 4);
-
-                bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
-                                    old_saddr, new_saddr, 4 | BPF_F_PSEUDO_HDR);
-                bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
-                                    old_sport, new_sport, 2);
-
-                bpf_map_delete_elem(&xdns_sessions, &s_key);
-                /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+            struct dnshdr *dns = (void *)((char *)udp + sizeof(struct udphdr));
+            if ((void *)(dns + 1) > data_end)
                 return TC_ACT_UNSPEC;
+
+            /* QR == 1 (Response) */
+            if ((bpf_ntohs(dns->flags) & 0x8000) != 0) {
+                __u16 ancount = bpf_ntohs(dns->ancount);
+                if (ancount > 0) {
+                    __u32 stats_key = 0;
+                    struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
+                    if (stats) stats->dns_responses_parsed++;
+
+                    /* Parse response answer: skip Question QNAME */
+                    unsigned char *ptr = (unsigned char *)dns + sizeof(struct dnshdr);
+                    #pragma unroll
+                    for (int step = 0; step < 64; step++) {
+                        if ((void *)(ptr + 1) > data_end) break;
+                        unsigned char l = *ptr;
+                        ptr++;
+                        if (l == 0) break;
+                        if ((l & 0xC0) == 0xC0) {
+                            ptr++; /* pointer is 2 bytes total */
+                            break;
+                        }
+                    }
+                    /* Skip QTYPE (2) + QCLASS (2) */
+                    ptr += 4;
+
+                    /* Parse Answer RRs in loop (up to 4 answers) to support CNAME chains and multi-A records */
+                    for (int a = 0; a < 4; a++) {
+                        if (a >= ancount) break;
+                        if ((void *)(ptr + 2) > data_end) break;
+
+                        /* Skip Answer NAME: standard compression pointer (0xC0xx) or root */
+                        unsigned char a0 = *ptr;
+                        if ((a0 & 0xC0) == 0xC0) {
+                            ptr += 2;
+                        } else if (a0 == 0) {
+                            ptr += 1;
+                        } else {
+                            break;
+                        }
+
+                        /* Require type(2) + class(2) + ttl(4) + rdlength(2) = 10 bytes */
+                        if ((void *)(ptr + 10) > data_end) break;
+
+                        __u16 atype = *(__u16 *)ptr;
+                        __u32 attl = 0;
+                        __builtin_memcpy(&attl, ptr + 4, 4);
+                        __u16 raw_rdlen = 0;
+                        __builtin_memcpy(&raw_rdlen, ptr + 8, 2);
+                        __u16 rdlen = bpf_ntohs(raw_rdlen);
+
+                        /* Type A (1) and IPv4 length 4 */
+                        if (atype == bpf_htons(1) && rdlen == 4) {
+                            if ((void *)(ptr + 14) > data_end) break;
+                            __u32 ans_ip = 0;
+                            __builtin_memcpy(&ans_ip, ptr + 10, 4);
+                            __u32 ttl_sec = bpf_ntohl(attl);
+                            if (ttl_sec < 60) ttl_sec = 60;
+                            if (ttl_sec > 86400) ttl_sec = 86400;
+
+                            __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
+                            bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY);
+                        }
+
+                        /* Advance pointer to next RR (handles both CNAME and A records) */
+                        if (rdlen > 128) break;
+                        ptr += 10;
+                        ptr += (rdlen & 0x7f);
+                        if ((void *)ptr > data_end) break;
+                    }
+                }
+
+                /* Lookup session to reverse-SNAT */
+                struct xdns_session_key s_key = {
+                    .client_ip = ip->daddr,
+                    .client_port = udp->dest,
+                    .tx_id = dns->id,
+                };
+                struct xdns_session_val *s_val = bpf_map_lookup_elem(&xdns_sessions, &s_key);
+                if (s_val) {
+                    __u32 old_saddr = ip->saddr;
+                    __u32 new_saddr = s_val->orig_dst_ip;
+                    __u16 old_sport = udp->source;
+                    __u16 new_sport = s_val->orig_dst_port;
+
+                    __u32 udp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
+
+                    ip->saddr = new_saddr;
+                    udp->source = new_sport;
+
+                    bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check),
+                                        old_saddr, new_saddr, 4);
+
+                    bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
+                                        old_saddr, new_saddr, 4 | BPF_F_PSEUDO_HDR);
+                    bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
+                                        old_sport, new_sport, 2);
+
+                    bpf_map_delete_elem(&xdns_sessions, &s_key);
+                    /* Cascade to downstream filter */
+                    return TC_ACT_UNSPEC;
+                }
             }
         }
     }
-        }
 
     /* 2. Handle TCP traffic returning from xkcptun transparent proxy */
     if (ip->protocol == IPPROTO_TCP) {
@@ -489,13 +498,42 @@ int tc_xdns_egress(struct __sk_buff *skb)
                     bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
                 }
 
-                /* Cascade to downstream filter (pref 2: aw-bpf.o) */
+                /* Cascade to downstream filter */
                 return TC_ACT_UNSPEC;
             }
         }
     }
 
     return TC_ACT_UNSPEC;
+}
+
+/*
+ * XDNS_MODE_GATEWAY controls whether we are running on a Router/Gateway or Host:
+ * - XDNS_MODE_GATEWAY = 1 (Gateway Mode): Ingress intercepts LAN clients, Egress handles return traffic
+ * - XDNS_MODE_GATEWAY = 0 (Host Mode, Default): Egress intercepts local host apps, Ingress handles return traffic
+ */
+#ifndef XDNS_MODE_GATEWAY
+#define XDNS_MODE_GATEWAY 0
+#endif
+
+SEC("classifier/ingress")
+int tc_xdns_ingress(struct __sk_buff *skb)
+{
+#if XDNS_MODE_GATEWAY
+    return process_outbound(skb);
+#else
+    return process_inbound(skb);
+#endif
+}
+
+SEC("classifier/egress")
+int tc_xdns_egress(struct __sk_buff *skb)
+{
+#if XDNS_MODE_GATEWAY
+    return process_inbound(skb);
+#else
+    return process_outbound(skb);
+#endif
 }
 
 char _license[] SEC("license") = "GPL";

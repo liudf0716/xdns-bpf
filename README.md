@@ -96,15 +96,15 @@ xdns-ctl stats
 
 ## Building
 
+This project uses CMake for building:
+
 ```bash
-# Build userspace CLI (xdns-ctl)
-make xdns-ctl
-
-# Build eBPF object (requires clang and linux headers)
-make xdns_bpf.o
-
-# Or build via CMake
+# Build with default Host mode (for local PC / workstation)
 cmake -B build -S .
+cmake --build build
+
+# Or build for Gateway mode (for routers / gateways)
+cmake -B build -S . -DXDNS_MODE=GATEWAY
 cmake --build build
 ```
 
