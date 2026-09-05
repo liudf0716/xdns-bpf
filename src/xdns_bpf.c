@@ -14,6 +14,11 @@
 #define LIBBPF_PIN_BY_NAME 1
 #endif
 
+/* skb mark applied to every packet this program DNAT/reverse-SNATs, so that
+ * netfilter (raw-priority notrack) can exempt redirected flows from
+ * conntrack and early-accept them. See xdns.init (xdns_skip table). */
+#define XDNS_SK_MARK		0x58444e53U	/* "XDNS" */
+
 #define MAX_DNS_NAME_LEN 128
 #define MAX_DNS_LABELS   8
 
@@ -238,6 +243,8 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
                     bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                         old_dport, new_dport, 2);
 
+                    skb->mark = XDNS_SK_MARK;	/* exempt from conntrack/netfilter */
+
                     /* Cascade to downstream filter */
                     return TC_ACT_UNSPEC;
                 }
@@ -316,6 +323,8 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
                                 old_daddr, new_daddr, 4 | BPF_F_PSEUDO_HDR);
             bpf_l4_csum_replace(skb, tcp_offset + offsetof(struct tcphdr, check),
                                 old_dport, new_dport, 2);
+
+            skb->mark = XDNS_SK_MARK;	/* exempt from conntrack/netfilter */
 
             /* Cascade to downstream filter */
             return TC_ACT_UNSPEC;
@@ -462,6 +471,8 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
                                         old_sport, new_sport, 2);
 
                     bpf_map_delete_elem(&xdns_sessions, &s_key);
+                    skb->mark = XDNS_SK_MARK;	/* exempt from conntrack/netfilter */
+
                     /* Cascade to downstream filter */
                     return TC_ACT_UNSPEC;
                 }
@@ -506,6 +517,8 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
                 if (is_closing) {
                     bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
                 }
+
+                skb->mark = XDNS_SK_MARK;	/* exempt from conntrack/netfilter */
 
                 /* Cascade to downstream filter */
                 return TC_ACT_UNSPEC;
