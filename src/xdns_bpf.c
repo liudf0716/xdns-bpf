@@ -389,8 +389,8 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
                     /* Skip QTYPE (2) + QCLASS (2) */
                     ptr += 4;
 
-                    /* Parse Answer RRs in loop (up to 4 answers) to support CNAME chains and multi-A records */
-                    for (int a = 0; a < 4; a++) {
+                    /* Parse Answer RRs in loop (up to XDNS_MAX_DNS_ANSWERS) to support CNAME chains and multi-A records */
+                    for (int a = 0; a < XDNS_MAX_DNS_ANSWERS; a++) {
                         if (a >= ancount) break;
                         if ((void *)(ptr + 2) > data_end) break;
 

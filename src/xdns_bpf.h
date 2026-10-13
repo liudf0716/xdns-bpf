@@ -5,6 +5,7 @@
 
 #define XDNS_FNV1A_64_OFFSET 14695981039346656037ULL
 #define XDNS_FNV1A_64_PRIME  1099511628211ULL
+#define XDNS_MAX_DNS_ANSWERS 7
 
 /* Session tracking key for DNS queries */
 struct xdns_session_key {
