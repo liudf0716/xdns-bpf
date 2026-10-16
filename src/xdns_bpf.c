@@ -111,18 +111,34 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
 
         if (c == 0) {
             /* End of QNAME: check full domain and parent subdomains */
+            int matched = 0;
             __u8 *found = bpf_map_lookup_elem(&xdns_domains, &h_full);
-            if (found && *found == 1) return 1;
-
-            if (h_sub2) {
+            if (found && *found == 1) {
+                matched = 1;
+            } else if (h_sub2) {
                 found = bpf_map_lookup_elem(&xdns_domains, &h_sub2);
-                if (found && *found == 1) return 1;
+                if (found && *found == 1) matched = 1;
             }
-            if (h_sub1) {
+            if (!matched && h_sub1) {
                 found = bpf_map_lookup_elem(&xdns_domains, &h_sub1);
-                if (found && *found == 1) return 1;
+                if (found && *found == 1) matched = 1;
             }
-            return 0;
+            if (!matched) return 0;
+
+            /* Check QTYPE: only intercept Type A (IPv4 = 1).
+             * Filter out Type AAAA (IPv6 = 28) and Type HTTPS (SVCB = 65)
+             * so that local dnsmasq (filter_aaaa / filter-rr=65) handles them,
+             * preventing IPv6 connection failures and QUIC/HTTP3 stalls.
+             */
+            if ((void *)(ptr + 2) > data_end)
+                return 0;
+
+            __u16 qtype = 0;
+            __builtin_memcpy(&qtype, ptr, 2);
+            if (qtype != bpf_htons(1))
+                return 0;
+
+            return 1;
         }
 
         if (c <= 63) {
