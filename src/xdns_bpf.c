@@ -80,6 +80,23 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } xdns_stats_map SEC(".maps");
 
+/* Traffic steered to each learned address. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, __u32);
+    __type(value, struct xdns_ip_traffic);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} xdns_ip_traffic SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, __u32);
+    __type(value, struct xdns_ip_name);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} xdns_ip_name SEC(".maps");
+
 /* DNS Header */
 struct dnshdr {
     __u16 id;
@@ -91,8 +108,9 @@ struct dnshdr {
 } __attribute__((packed));
 
 
-/* Parse DNS QNAME from payload and test against proxy domains (supports 2 levels of wildcard subdomains) */
-static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
+/* Parse DNS QNAME and test against proxy domains (up to 2 wildcard parents).
+ * On a hit, *matched_hash is the list entry that matched. The string stays in userspace. */
+static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset, __u64 *matched_hash)
 {
     unsigned char *ptr = (unsigned char *)data + udp_offset + sizeof(struct udphdr) + sizeof(struct dnshdr);
     __u64 h_full = XDNS_FNV1A_64_OFFSET;
@@ -111,19 +129,21 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
 
         if (c == 0) {
             /* End of QNAME: check full domain and parent subdomains */
-            int matched = 0;
+            __u64 hit = 0;
             __u8 *found = bpf_map_lookup_elem(&xdns_domains, &h_full);
             if (found && *found == 1) {
-                matched = 1;
+                hit = h_full;
             } else if (h_sub2) {
                 found = bpf_map_lookup_elem(&xdns_domains, &h_sub2);
-                if (found && *found == 1) matched = 1;
+                if (found && *found == 1) hit = h_sub2;
             }
-            if (!matched && h_sub1) {
+            if (!hit && h_sub1) {
                 found = bpf_map_lookup_elem(&xdns_domains, &h_sub1);
-                if (found && *found == 1) matched = 1;
+                if (found && *found == 1) hit = h_sub1;
             }
-            if (!matched) return 0;
+            if (!hit) return 0;
+            if (matched_hash)
+                *matched_hash = hit;
 
             /* Check QTYPE: only intercept Type A (IPv4 = 1).
              * Filter out Type AAAA (IPv6 = 28) and Type HTTPS (SVCB = 65)
@@ -176,6 +196,30 @@ static inline int match_dns_qname(void *data, void *data_end, __u32 udp_offset)
     return 0;
 }
 
+static __always_inline struct xdns_stats *stats_slot(void)
+{
+    __u32 key = 0;
+    return bpf_map_lookup_elem(&xdns_stats_map, &key);
+}
+
+static __always_inline void account_ip(__u32 ip, __u32 bytes, int new_conn)
+{
+    struct xdns_ip_traffic *t = bpf_map_lookup_elem(&xdns_ip_traffic, &ip);
+    if (!t) {
+        struct xdns_ip_traffic zero = {};
+        bpf_map_update_elem(&xdns_ip_traffic, &ip, &zero, BPF_NOEXIST);
+        t = bpf_map_lookup_elem(&xdns_ip_traffic, &ip);
+    }
+    if (!t)
+        return;
+    if (bytes || !new_conn) {
+        t->packets++;
+        t->bytes += bytes;
+    }
+    if (new_conn)
+        t->connections++;
+}
+
 /*
  * Process outbound traffic (Client requests):
  * - DNS query interception and DNAT redirect to xkcptun DNS port
@@ -202,8 +246,7 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
     if (!cfg || cfg->enabled == 0)
         return TC_ACT_UNSPEC;
 
-    __u32 stats_key = 0;
-    struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
+    struct xdns_stats *stats = stats_slot();
 
     /* 1. Handle UDP DNS queries */
     if (ip->protocol == IPPROTO_UDP) {
@@ -212,8 +255,6 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
             return TC_ACT_UNSPEC;
 
         if (udp->dest == bpf_htons(53)) {
-            if (stats) stats->dns_queries_total++;
-
             __u32 udp_offset = sizeof(struct ethhdr) + (ip->ihl * 4);
             struct dnshdr *dns = (void *)((char *)udp + sizeof(struct udphdr));
             if ((void *)(dns + 1) > data_end)
@@ -221,7 +262,12 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
 
             /* Check QR == 0 (Query) and QDCOUNT > 0 */
             if ((bpf_ntohs(dns->flags) & 0x8000) == 0 && bpf_ntohs(dns->qdcount) > 0) {
-                if (match_dns_qname(data, data_end, udp_offset)) {
+                __u64 name_hash = 0;
+                if (match_dns_qname(data, data_end, udp_offset, &name_hash)) {
+                    if (!cfg->xkcp_dns_ip || !cfg->xkcp_dns_port) {
+                        if (stats) stats->dns_forward_failed++;
+                        return TC_ACT_UNSPEC;
+                    }
                     if (stats) stats->dns_queries_proxied++;
 
                     /* Record session for reverse-SNAT */
@@ -234,6 +280,7 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
                         .orig_dst_ip = ip->daddr,
                         .orig_dst_port = udp->dest,
                         .timestamp = bpf_ktime_get_ns(),
+                        .name_hash = name_hash,
                     };
                     bpf_map_update_elem(&xdns_sessions, &s_key, &s_val, BPF_ANY);
 
@@ -257,6 +304,7 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
                     /* Cascade to downstream filter */
                     return TC_ACT_UNSPEC;
                 }
+                if (stats) stats->dns_queries_passed++;
             }
         }
     }
@@ -286,7 +334,8 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
             __u64 now = bpf_ktime_get_ns();
 
             if (expire_ts && now < *expire_ts) {
-                if (stats) stats->tcp_redirected++;
+                if (stats) stats->tcp_connections++;
+                account_ip(ip->daddr, bpf_ntohs(ip->tot_len), 1);
 
                 struct xdns_tcp_session_val t_val = {
                     .orig_dst_ip = ip->daddr,
@@ -307,6 +356,11 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
             struct xdns_tcp_session_val *existing = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
             if (existing && existing->orig_dst_ip == ip->daddr && existing->orig_dst_port == tcp->dest) {
                 redirect = 1;
+                if (stats) {
+                    stats->tcp_packets++;
+                    stats->tcp_bytes += bpf_ntohs(ip->tot_len);
+                }
+                account_ip(existing->orig_dst_ip, bpf_ntohs(ip->tot_len), 0);
                 if (is_rst) {
                     bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
                 }
@@ -314,6 +368,10 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
         }
 
         if (redirect) {
+            if (is_syn && stats) {
+                stats->tcp_packets++;
+                stats->tcp_bytes += bpf_ntohs(ip->tot_len);
+            }
             /* DNAT: Rewrite destination to xkcptun transparent proxy port */
             __u32 old_daddr = ip->daddr;
             __u32 new_daddr = cfg->xkcp_tcp_ip;
@@ -384,15 +442,15 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
             /* QR == 1 (Response) */
             if ((bpf_ntohs(dns->flags) & 0x8000) != 0) {
                 __u16 ancount = bpf_ntohs(dns->ancount);
+                struct xdns_stats *stats = stats_slot();
+                /* Every A address in this reply, not only the last one. */
+                __u32 lip0 = 0, lip1 = 0, lip2 = 0, lip3 = 0;
+                int nlearned = 0;
                 if (ancount > 0) {
-                    __u32 stats_key = 0;
-                    struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
-                    if (stats) stats->dns_responses_parsed++;
-
                     /* Parse response answer: skip Question QNAME */
                     unsigned char *ptr = (unsigned char *)dns + sizeof(struct dnshdr);
                     #pragma unroll
-                    for (int step = 0; step < 64; step++) {
+                    for (int step = 0; step < 40; step++) {
                         if ((void *)(ptr + 1) > data_end) break;
                         unsigned char l = *ptr;
                         ptr++;
@@ -440,7 +498,14 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
                             if (ttl_sec > 86400) ttl_sec = 86400;
 
                             __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
-                            bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY);
+                            if (bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY) == 0) {
+                                if (stats) stats->dns_answers_learned++;
+                                if (nlearned == 0) lip0 = ans_ip;
+                                else if (nlearned == 1) lip1 = ans_ip;
+                                else if (nlearned == 2) lip2 = ans_ip;
+                                else if (nlearned == 3) lip3 = ans_ip;
+                                if (nlearned < 4) nlearned++;
+                            }
                         }
 
                         /* Advance pointer to next RR (handles both CNAME and A records) */
@@ -477,10 +542,22 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
                     bpf_l4_csum_replace(skb, udp_offset + offsetof(struct udphdr, check),
                                         old_sport, new_sport, 2);
 
+                    if (nlearned > 0 && s_val->name_hash) {
+                        struct xdns_ip_name nm = { .hash = s_val->name_hash };
+                        if (nlearned > 0)
+                            bpf_map_update_elem(&xdns_ip_name, &lip0, &nm, BPF_ANY);
+                        if (nlearned > 1)
+                            bpf_map_update_elem(&xdns_ip_name, &lip1, &nm, BPF_ANY);
+                        if (nlearned > 2)
+                            bpf_map_update_elem(&xdns_ip_name, &lip2, &nm, BPF_ANY);
+                        if (nlearned > 3)
+                            bpf_map_update_elem(&xdns_ip_name, &lip3, &nm, BPF_ANY);
+                    }
                     bpf_map_delete_elem(&xdns_sessions, &s_key);
                     /* Cascade to downstream filter */
                     return TC_ACT_UNSPEC;
                 }
+                if (stats) stats->dns_forward_failed++;
             }
         }
     }
@@ -500,6 +577,13 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
             };
             struct xdns_tcp_session_val *t_val = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
             if (t_val) {
+                struct xdns_stats *stats = stats_slot();
+                if (stats) {
+                    stats->tcp_packets++;
+                    stats->tcp_bytes += bpf_ntohs(ip->tot_len);
+                }
+                account_ip(t_val->orig_dst_ip, bpf_ntohs(ip->tot_len), 0);
+
                 __u32 old_saddr = ip->saddr;
                 __u32 new_saddr = t_val->orig_dst_ip;
                 __u16 old_sport = tcp->source;
@@ -580,9 +664,13 @@ int xdns_connect4(struct bpf_sock_addr *ctx)
 
     /* Handle UDP DNS connect redirect (optional for connected UDP sockets) */
     if (ctx->protocol == IPPROTO_UDP && ctx->user_port == bpf_htons(53)) {
+        struct xdns_stats *stats = stats_slot();
         if (cfg->xkcp_dns_ip && cfg->xkcp_dns_port) {
             ctx->user_ip4 = cfg->xkcp_dns_ip;
             ctx->user_port = cfg->xkcp_dns_port;
+            if (stats) stats->dns_queries_proxied++;
+        } else if (stats) {
+            stats->dns_forward_failed++;
         }
         return 1;
     }
@@ -606,9 +694,9 @@ int xdns_connect4(struct bpf_sock_addr *ctx)
             ctx->user_ip4 = cfg->xkcp_tcp_ip;
             ctx->user_port = cfg->xkcp_tcp_port;
 
-            __u32 stats_key = 0;
-            struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
-            if (stats) stats->tcp_redirected++;
+            struct xdns_stats *stats = stats_slot();
+            if (stats) stats->tcp_connections++;
+            account_ip(dst_ip, 0, 1);
         }
     }
     return 1;
@@ -624,13 +712,13 @@ int xdns_sendmsg4(struct bpf_sock_addr *ctx)
 
     /* Intercept unconnected UDP DNS queries (standard getaddrinfo / musl / glibc) */
     if (ctx->user_port == bpf_htons(53)) {
+        struct xdns_stats *stats = stats_slot();
         if (cfg->xkcp_dns_ip && cfg->xkcp_dns_port) {
             ctx->user_ip4 = cfg->xkcp_dns_ip;
             ctx->user_port = cfg->xkcp_dns_port;
-
-            __u32 stats_key = 0;
-            struct xdns_stats *stats = bpf_map_lookup_elem(&xdns_stats_map, &stats_key);
             if (stats) stats->dns_queries_proxied++;
+        } else if (stats) {
+            stats->dns_forward_failed++;
         }
     }
     return 1;

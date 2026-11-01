@@ -5,7 +5,7 @@
 
 #define XDNS_FNV1A_64_OFFSET 14695981039346656037ULL
 #define XDNS_FNV1A_64_PRIME  1099511628211ULL
-#define XDNS_MAX_DNS_ANSWERS 7
+#define XDNS_MAX_DNS_ANSWERS 4
 
 /* Session tracking key for DNS queries */
 struct xdns_session_key {
@@ -19,6 +19,7 @@ struct xdns_session_val {
     __u32 orig_dst_ip;
     __u16 orig_dst_port;
     __u64 timestamp;
+    __u64 name_hash; /* FNV-1a of the proxy-list name that matched */
 };
 
 /* Session tracking key for TCP transparent redirect */
@@ -52,12 +53,32 @@ struct xdns_config {
     __u32 enabled;        /* 1 = active, 0 = bypass all */
 };
 
-/* Operational statistics */
+/* Operational statistics. DNS counters mean the same thing on TC and host:
+ * proxied is a query actually redirected to the forwarder, passed is a query
+ * left on its original resolver, failed is a redirect or reply that could
+ * not be completed. Host UDP cannot see the qname, so every UDP/53 rewrite
+ * there is proxied rather than passed.
+ */
 struct xdns_stats {
-    __u64 dns_queries_total;
     __u64 dns_queries_proxied;
-    __u64 dns_responses_parsed;
-    __u64 tcp_redirected;
+    __u64 dns_queries_passed;
+    __u64 dns_forward_failed;
+    __u64 dns_answers_learned;
+    __u64 tcp_connections;
+    __u64 tcp_packets;
+    __u64 tcp_bytes;
+};
+
+/* Per hijacked IPv4 address. Values are per-CPU and summed in userspace. */
+struct xdns_ip_traffic {
+    __u64 packets;
+    __u64 bytes;
+    __u64 connections;
+};
+
+/* Proxy-list domain hash remembered with each learned address. */
+struct xdns_ip_name {
+    __u64 hash;
 };
 
 /* DNS Resource Record header in answer */

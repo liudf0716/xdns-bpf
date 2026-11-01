@@ -94,13 +94,14 @@ static void print_usage(const char *prog)
     printf("  list-domains [file]                List proxy domains and kernel map status\n");
     printf("  load-domains <file>                Batch load proxy domains file (additive)\n");
     printf("  reload-domains [file]              Replace kernel domains from file and clear resolved IPs\n");
-    printf("  list-ips                           List dynamic hijacked IP set\n");
+    printf("  list-ips                           List hijacked IPs and steered traffic\n");
     printf("  clear-ips                          Clear all resolved IPs from kernel map\n");
     printf("  list-sessions                      List active transparent TCP proxy sessions\n");
     printf("  set-config <dns_ip:port> <tcp_ip:port> [enable:1|0]\n");
     printf("                                     Configure xkcptun redirect endpoints\n");
     printf("  host-start [obj_file] [cgroup_dir] Start Host mode eBPF cgroup redirection\n");
     printf("  host-stop [cgroup_dir]             Stop Host mode eBPF cgroup redirection\n");
+    printf("  status                             Report whether tc filters are attached\n");
     printf("  stats                              Display interception statistics\n");
     printf("\n");
 }
@@ -323,6 +324,18 @@ static int cmd_clear_ips(void)
         perror("Failed to clear xdns_ip_set");
         return 1;
     }
+    int tfd = bpf_open_map("xdns_ip_traffic");
+    if (tfd >= 0) {
+        key = 0;
+        bpf_map_clear(tfd, &key, sizeof(key));
+        close(tfd);
+    }
+    int nfd = bpf_open_map("xdns_ip_name");
+    if (nfd >= 0) {
+        key = 0;
+        bpf_map_clear(nfd, &key, sizeof(key));
+        close(nfd);
+    }
 
     printf("Cleared %d resolved IPs from xdns_ip_set\n", deleted);
     return 0;
@@ -403,6 +416,70 @@ static int cmd_list_domains(const char *file)
     return 0;
 }
 
+static void sum_ip_traffic(int tfd, __u32 ip, long ncpus, __u64 *packets, __u64 *bytes, __u64 *conns)
+{
+    *packets = *bytes = *conns = 0;
+    if (tfd < 0)
+        return;
+    struct xdns_ip_traffic *arr = calloc(ncpus, sizeof(*arr));
+    if (!arr)
+        return;
+    if (bpf_map_lookup(tfd, &ip, arr) == 0) {
+        for (long i = 0; i < ncpus; i++) {
+            *packets += arr[i].packets;
+            *bytes += arr[i].bytes;
+            *conns += arr[i].connections;
+        }
+    }
+    free(arr);
+}
+
+struct name_ent {
+    __u64 hash;
+    char name[256];
+};
+
+static int load_name_table(struct name_ent **out, int *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    FILE *fp = fopen(get_default_domains_path(NULL), "r");
+    if (!fp)
+        return 0;
+    struct name_ent *tab = NULL;
+    int n = 0, cap = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char norm[256];
+        normalize_domain(line, norm, sizeof(norm));
+        if (!norm[0])
+            continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 64;
+            struct name_ent *grown = realloc(tab, (size_t)cap * sizeof(*tab));
+            if (!grown)
+                break;
+            tab = grown;
+        }
+        tab[n].hash = xdns_hash_domain(norm);
+        snprintf(tab[n].name, sizeof(tab[n].name), "%s", norm);
+        n++;
+    }
+    fclose(fp);
+    *out = tab;
+    *nout = n;
+    return n;
+}
+
+static const char *lookup_name(struct name_ent *tab, int n, __u64 hash)
+{
+    for (int i = 0; i < n; i++) {
+        if (tab[i].hash == hash)
+            return tab[i].name;
+    }
+    return NULL;
+}
+
 static int cmd_list_ips(void)
 {
     int fd = bpf_open_map("xdns_ip_set");
@@ -410,13 +487,21 @@ static int cmd_list_ips(void)
         perror("Failed to open xdns_ip_set map");
         return 1;
     }
+    int tfd = bpf_open_map("xdns_ip_traffic");
+    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpus < 1) ncpus = 1;
 
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     __u64 now_ns = (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
 
-    printf("%-18s %-12s\n", "IP Address", "Expires In");
-    printf("------------------------------------\n");
+    int nfd = bpf_open_map("xdns_ip_name");
+    struct name_ent *names = NULL;
+    int nnames = 0;
+    load_name_table(&names, &nnames);
+
+    printf("%-40s %-18s %-12s %-12s %-14s %-12s\n", "Website", "IP Address", "Expires In", "Connections", "Packets", "Bytes");
+    printf("----------------------------------------------------------------------------------------------------------------\n");
 
     __u32 key, next_key;
     int has_first = 0;
@@ -439,7 +524,19 @@ static int cmd_list_ips(void)
             if (expire_ts > now_ns) {
                 remaining_sec = (expire_ts - now_ns) / 1000000000ULL;
             }
-            printf("%-18s %llds\n", ip_str, remaining_sec);
+            struct xdns_ip_name nm;
+            const char *website = "-";
+            memset(&nm, 0, sizeof(nm));
+            if (nfd >= 0 && bpf_map_lookup(nfd, &key, &nm) == 0 && nm.hash) {
+                const char *found = lookup_name(names, nnames, nm.hash);
+                if (found)
+                    website = found;
+            }
+            __u64 packets = 0, bytes = 0, conns = 0;
+            sum_ip_traffic(tfd, key, ncpus, &packets, &bytes, &conns);
+            printf("%-40s %-18s %-12lld %-12llu %-14llu %-12llu\n", website, ip_str, remaining_sec,
+                   (unsigned long long)conns, (unsigned long long)packets,
+                   (unsigned long long)bytes);
             count++;
         }
 
@@ -449,6 +546,11 @@ static int cmd_list_ips(void)
     }
 
     printf("Total active proxy IPs: %d\n", count);
+    free(names);
+    if (tfd >= 0)
+        close(tfd);
+    if (nfd >= 0)
+        close(nfd);
     close(fd);
     return 0;
 }
@@ -461,8 +563,13 @@ static int cmd_list_sessions(void)
         return 1;
     }
 
-    printf("%-24s %-24s %-12s\n", "Client Endpoint", "Original Target", "Last Seen");
-    printf("--------------------------------------------------------------------\n");
+    int nfd = bpf_open_map("xdns_ip_name");
+    struct name_ent *names = NULL;
+    int nnames = 0;
+    load_name_table(&names, &nnames);
+
+    printf("%-32s %-24s %-24s %-12s\n", "Website", "Client Endpoint", "Original Target", "Last Seen");
+    printf("------------------------------------------------------------------------------------------------\n");
 
     struct xdns_tcp_session_key key, next_key;
     memset(&key, 0, sizeof(key));
@@ -493,8 +600,17 @@ static int cmd_list_sessions(void)
             snprintf(cstr, sizeof(cstr), "%s:%u", cip, ntohs(key.client_port));
             snprintf(tstr, sizeof(tstr), "%s:%u", tip, ntohs(val.orig_dst_port));
 
+            const char *website = "-";
+            struct xdns_ip_name nm;
+            memset(&nm, 0, sizeof(nm));
+            if (nfd >= 0 && bpf_map_lookup(nfd, &val.orig_dst_ip, &nm) == 0 && nm.hash) {
+                const char *found = lookup_name(names, nnames, nm.hash);
+                if (found)
+                    website = found;
+            }
+
             unsigned long long age_sec = (now_ns > val.timestamp) ? (now_ns - val.timestamp) / 1000000000ULL : 0;
-            printf("%-24s %-24s %llus ago\n", cstr, tstr, age_sec);
+            printf("%-32s %-24s %-24s %llus ago\n", website, cstr, tstr, age_sec);
             count++;
         }
 
@@ -503,8 +619,11 @@ static int cmd_list_sessions(void)
         key = next_key;
     }
 
+    free(names);
+    if (nfd >= 0)
+        close(nfd);
     close(fd);
-    printf("--------------------------------------------------------------------\n");
+    printf("------------------------------------------------------------------------------------------------\n");
     printf("Total active TCP sessions: %d\n", count);
     return 0;
 }
@@ -559,6 +678,66 @@ static int cmd_set_config(const char *dns_ep, const char *tcp_ep, int enabled)
     return 0;
 }
 
+static int ifname_ok(const char *s)
+{
+    if (!s || !s[0] || strlen(s) >= 16)
+        return 0;
+    for (const char *p = s; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
+            return 0;
+    }
+    return 1;
+}
+
+static void read_ifname(char *out, size_t outlen)
+{
+    snprintf(out, outlen, "br-lan");
+    FILE *fp = popen("uci -q get xdns.global.ifname", "r");
+    if (!fp)
+        return;
+    char buf[64];
+    if (fgets(buf, sizeof(buf), fp)) {
+        buf[strcspn(buf, "\r\n")] = '\0';
+        if (ifname_ok(buf))
+            snprintf(out, outlen, "%s", buf);
+    }
+    pclose(fp);
+}
+
+static int tc_has(const char *ifname, const char *dir, const char *needle)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "tc filter show dev %s %s 2>/dev/null", ifname, dir);
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return 0;
+    char line[512];
+    int hit = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, needle)) {
+            hit = 1;
+            break;
+        }
+    }
+    pclose(fp);
+    return hit;
+}
+
+/* xdns has no daemon. Running means both tc programs are attached. */
+static int cmd_status(void)
+{
+    char ifname[16];
+    read_ifname(ifname, sizeof(ifname));
+    int ingress = tc_has(ifname, "ingress", "tc_xdns_ingress");
+    int egress = tc_has(ifname, "egress", "tc_xdns_egress");
+    printf("Interface : %s\n", ifname);
+    printf("Ingress   : %s\n", ingress ? "attached" : "missing");
+    printf("Egress    : %s\n", egress ? "attached" : "missing");
+    printf("Running   : %s\n", (ingress && egress) ? "yes" : "no");
+    return (ingress && egress) ? 0 : 1;
+}
+
 static int cmd_stats(void)
 {
     int fd = bpf_open_map("xdns_stats_map");
@@ -582,19 +761,25 @@ static int cmd_stats(void)
     struct xdns_stats total;
     memset(&total, 0, sizeof(total));
     for (int i = 0; i < ncpus; i++) {
-        total.dns_queries_total += stats_arr[i].dns_queries_total;
         total.dns_queries_proxied += stats_arr[i].dns_queries_proxied;
-        total.dns_responses_parsed += stats_arr[i].dns_responses_parsed;
-        total.tcp_redirected += stats_arr[i].tcp_redirected;
+        total.dns_queries_passed += stats_arr[i].dns_queries_passed;
+        total.dns_forward_failed += stats_arr[i].dns_forward_failed;
+        total.dns_answers_learned += stats_arr[i].dns_answers_learned;
+        total.tcp_connections += stats_arr[i].tcp_connections;
+        total.tcp_packets += stats_arr[i].tcp_packets;
+        total.tcp_bytes += stats_arr[i].tcp_bytes;
     }
     free(stats_arr);
     close(fd);
 
     printf("================ xdns-bpf Statistics ================\n");
-    printf("  DNS Queries Intercepted  : %llu\n", (unsigned long long)total.dns_queries_total);
     printf("  DNS Queries Proxied      : %llu\n", (unsigned long long)total.dns_queries_proxied);
-    printf("  DNS Responses Learned    : %llu\n", (unsigned long long)total.dns_responses_parsed);
-    printf("  TCP Connections Proxied  : %llu\n", (unsigned long long)total.tcp_redirected);
+    printf("  DNS Queries Passed       : %llu\n", (unsigned long long)total.dns_queries_passed);
+    printf("  DNS Forward Failed       : %llu\n", (unsigned long long)total.dns_forward_failed);
+    printf("  DNS A Records Learned    : %llu\n", (unsigned long long)total.dns_answers_learned);
+    printf("  TCP Connections Steered  : %llu\n", (unsigned long long)total.tcp_connections);
+    printf("  TCP Packets Steered      : %llu\n", (unsigned long long)total.tcp_packets);
+    printf("  TCP Bytes Steered        : %llu\n", (unsigned long long)total.tcp_bytes);
     printf("======================================================\n");
     return 0;
 }
@@ -713,6 +898,8 @@ int main(int argc, char **argv)
         return cmd_host_start(argc >= 3 ? argv[2] : NULL, argc >= 4 ? argv[3] : NULL);
     } else if (strcmp(argv[1], "host-stop") == 0) {
         return cmd_host_stop(argc >= 3 ? argv[2] : NULL);
+    } else if (strcmp(argv[1], "status") == 0) {
+        return cmd_status();
     } else if (strcmp(argv[1], "stats") == 0) {
         return cmd_stats();
     } else {
