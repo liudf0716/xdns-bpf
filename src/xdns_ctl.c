@@ -510,11 +510,6 @@ static int cmd_load_ips(const char *file)
         if (bpf_map_lookup(fd, &next_key, &expire_ts) == 0) {
             if (expire_ts == 0xFFFFFFFFFFFFFFFFULL) {
                 is_static = 1;
-            } else if (nfd >= 0) {
-                struct xdns_ip_name nm;
-                if (bpf_map_lookup(nfd, &next_key, &nm) == 0 && nm.hash == static_hash) {
-                    is_static = 1;
-                }
             }
         }
         if (is_static) {
@@ -653,7 +648,6 @@ static int cmd_clear_ips(void)
 
     __u32 key, next_key;
     __u32 *cur_key = NULL;
-    __u64 static_hash = xdns_hash_domain("[static]");
 
     while (bpf_map_get_next_key(fd, cur_key, &next_key) == 0) {
         __u64 expire_ts = 0;
@@ -661,11 +655,6 @@ static int cmd_clear_ips(void)
         if (bpf_map_lookup(fd, &next_key, &expire_ts) == 0) {
             if (expire_ts == 0xFFFFFFFFFFFFFFFFULL) {
                 is_static = 1;
-            } else if (nfd >= 0) {
-                struct xdns_ip_name nm;
-                if (bpf_map_lookup(nfd, &next_key, &nm) == 0 && nm.hash == static_hash) {
-                    is_static = 1;
-                }
             }
         }
         if (!is_static) {
