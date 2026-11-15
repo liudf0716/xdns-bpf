@@ -271,6 +271,8 @@ static int cmd_add_ip(const char *ip_str, const char *ttl_str, const char *file)
         fprintf(stderr, "Error: Invalid IPv4 address '%s'\n", ip_str);
         return 1;
     }
+    char canonical_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &in, canonical_ip, sizeof(canonical_ip));
 
     int fd = bpf_open_map("xdns_ip_set");
     if (fd < 0) {
@@ -285,7 +287,13 @@ static int cmd_add_ip(const char *ip_str, const char *ttl_str, const char *file)
     __u64 expire_ts = 0xFFFFFFFFFFFFFFFFULL;
     long ttl_sec = 0;
     if (ttl_str && ttl_str[0] != '\0') {
-        ttl_sec = atol(ttl_str);
+        char *endptr = NULL;
+        ttl_sec = strtol(ttl_str, &endptr, 10);
+        if (*endptr != '\0' || ttl_sec < 0) {
+            fprintf(stderr, "Error: Invalid TTL '%s', must be a non-negative integer\n", ttl_str);
+            close(fd);
+            return 1;
+        }
         if (ttl_sec > 0) {
             expire_ts = now_ns + (__u64)ttl_sec * 1000000000ULL;
         }
@@ -308,9 +316,9 @@ static int cmd_add_ip(const char *ip_str, const char *ttl_str, const char *file)
     }
 
     if (ttl_sec > 0) {
-        printf("Kernel: Activated redirect IP '%s' (TTL: %ld seconds)\n", ip_str, ttl_sec);
+        printf("Kernel: Activated redirect IP '%s' (TTL: %ld seconds)\n", canonical_ip, ttl_sec);
     } else {
-        printf("Kernel: Activated redirect IP '%s' (permanent)\n", ip_str);
+        printf("Kernel: Activated redirect IP '%s' (permanent)\n", canonical_ip);
     }
 
     /* Persist to static_ips.txt if not temporary */
@@ -322,9 +330,12 @@ static int cmd_add_ip(const char *ip_str, const char *ttl_str, const char *file)
             char line[256];
             while (fgets(line, sizeof(line), fp)) {
                 char existing[64];
-                if (sscanf(line, "%63s", existing) == 1 && strcmp(existing, ip_str) == 0) {
-                    already_in_file = 1;
-                    break;
+                if (sscanf(line, "%63s", existing) == 1 && existing[0] != '#') {
+                    struct in_addr ex_in;
+                    if (inet_pton(AF_INET, existing, &ex_in) == 1 && ex_in.s_addr == in.s_addr) {
+                        already_in_file = 1;
+                        break;
+                    }
                 }
             }
             fclose(fp);
@@ -333,14 +344,15 @@ static int cmd_add_ip(const char *ip_str, const char *ttl_str, const char *file)
         if (!already_in_file) {
             fp = fopen(target_file, "a");
             if (fp) {
-                fprintf(fp, "%s\n", ip_str);
+                fprintf(fp, "%s\n", canonical_ip);
                 fclose(fp);
-                printf("File  : Appended '%s' to %s\n", ip_str, target_file);
+                printf("File  : Appended '%s' to %s\n", canonical_ip, target_file);
             } else {
-                fprintf(stderr, "Notice: Could not write to %s\n", target_file);
+                fprintf(stderr, "Error: Could not write to %s: %s\n", target_file, strerror(errno));
+                return 1;
             }
         } else {
-            printf("File  : IP '%s' already exists in %s\n", ip_str, target_file);
+            printf("File  : IP '%s' already exists in %s\n", canonical_ip, target_file);
         }
     }
 
@@ -354,6 +366,8 @@ static int cmd_del_ip(const char *ip_str, const char *file)
         fprintf(stderr, "Error: Invalid IPv4 address '%s'\n", ip_str);
         return 1;
     }
+    char canonical_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &in, canonical_ip, sizeof(canonical_ip));
 
     int fd = bpf_open_map("xdns_ip_set");
     if (fd < 0) {
@@ -362,16 +376,25 @@ static int cmd_del_ip(const char *ip_str, const char *file)
     }
 
     __u32 key = in.s_addr;
-    bpf_map_delete(fd, &key);
+    int del_ret = bpf_map_delete(fd, &key);
     close(fd);
+    if (del_ret < 0 && errno != ENOENT) {
+        perror("Failed to delete IP from xdns_ip_set map");
+        return 1;
+    }
 
     int nfd = bpf_open_map("xdns_ip_name");
     if (nfd >= 0) {
         bpf_map_delete(nfd, &key);
         close(nfd);
     }
+    int tfd = bpf_open_map("xdns_ip_traffic");
+    if (tfd >= 0) {
+        bpf_map_delete(tfd, &key);
+        close(tfd);
+    }
 
-    printf("Kernel: Removed redirect IP '%s'\n", ip_str);
+    printf("Kernel: Removed redirect IP '%s'\n", canonical_ip);
 
     const char *target_file = get_default_ips_path(file);
     if (access(target_file, F_OK) == 0) {
@@ -385,22 +408,31 @@ static int cmd_del_ip(const char *ip_str, const char *file)
                 int removed = 0;
                 while (fgets(line, sizeof(line), fp)) {
                     char existing[64];
-                    if (sscanf(line, "%63s", existing) == 1 && strcmp(existing, ip_str) == 0) {
-                        removed = 1;
-                        continue;
+                    if (sscanf(line, "%63s", existing) == 1 && existing[0] != '#') {
+                        struct in_addr ex_in;
+                        if (inet_pton(AF_INET, existing, &ex_in) == 1 && ex_in.s_addr == in.s_addr) {
+                            removed = 1;
+                            continue;
+                        }
                     }
                     fputs(line, wfp);
                 }
                 fclose(fp);
                 fclose(wfp);
                 if (removed) {
-                    rename(temp_file, target_file);
-                    printf("File  : Removed '%s' from %s\n", ip_str, target_file);
+                    if (rename(temp_file, target_file) != 0) {
+                        unlink(temp_file);
+                        fprintf(stderr, "Error: Could not update %s: %s\n", target_file, strerror(errno));
+                        return 1;
+                    }
+                    printf("File  : Removed '%s' from %s\n", canonical_ip, target_file);
                 } else {
                     unlink(temp_file);
                 }
             } else {
                 fclose(fp);
+                fprintf(stderr, "Error: Could not create temp file %s: %s\n", temp_file, strerror(errno));
+                return 1;
             }
         }
     }
@@ -416,40 +448,133 @@ static int cmd_load_ips(const char *file)
         return 0;
     }
 
-    int fd = bpf_open_map("xdns_ip_set");
-    if (fd < 0) {
+    size_t file_cap = 64;
+    __u32 *file_ips = malloc(file_cap * sizeof(__u32));
+    if (!file_ips) {
         fclose(fp);
         return 1;
     }
-    int nfd = bpf_open_map("xdns_ip_name");
+    size_t file_count = 0;
 
     char line[256];
-    int count = 0;
-    __u64 expire_ts = 0xFFFFFFFFFFFFFFFFULL;
-    __u64 static_hash = xdns_hash_domain("[static]");
-
     while (fgets(line, sizeof(line), fp)) {
         char ip_str[64];
         if (sscanf(line, "%63s", ip_str) != 1 || ip_str[0] == '#' || ip_str[0] == '\0')
             continue;
         struct in_addr in;
         if (inet_pton(AF_INET, ip_str, &in) == 1) {
-            __u32 key = in.s_addr;
-            if (bpf_map_update(fd, &key, &expire_ts, BPF_ANY) == 0) {
-                if (nfd >= 0) {
-                    struct xdns_ip_name nm;
-                    nm.hash = static_hash;
-                    bpf_map_update(nfd, &key, &nm, BPF_ANY);
+            int dup = 0;
+            for (size_t i = 0; i < file_count; i++) {
+                if (file_ips[i] == in.s_addr) {
+                    dup = 1;
+                    break;
                 }
-                count++;
+            }
+            if (!dup) {
+                if (file_count >= file_cap) {
+                    file_cap *= 2;
+                    __u32 *tmp = realloc(file_ips, file_cap * sizeof(__u32));
+                    if (!tmp) {
+                        fclose(fp);
+                        free(file_ips);
+                        return 1;
+                    }
+                    file_ips = tmp;
+                }
+                file_ips[file_count++] = in.s_addr;
             }
         }
     }
     fclose(fp);
+
+    int fd = bpf_open_map("xdns_ip_set");
+    if (fd < 0) {
+        free(file_ips);
+        return 1;
+    }
+    int nfd = bpf_open_map("xdns_ip_name");
+    int tfd = bpf_open_map("xdns_ip_traffic");
+
+    /* Scan existing kernel static entries, remove any not in file */
+    size_t stale_cap = 64;
+    __u32 *stale_ips = malloc(stale_cap * sizeof(__u32));
+    size_t stale_count = 0;
+
+    __u32 key, next_key;
+    __u32 *cur_key = NULL;
+    __u64 static_hash = xdns_hash_domain("[static]");
+
+    while (bpf_map_get_next_key(fd, cur_key, &next_key) == 0) {
+        __u64 expire_ts = 0;
+        int is_static = 0;
+        if (bpf_map_lookup(fd, &next_key, &expire_ts) == 0) {
+            if (expire_ts == 0xFFFFFFFFFFFFFFFFULL) {
+                is_static = 1;
+            } else if (nfd >= 0) {
+                struct xdns_ip_name nm;
+                if (bpf_map_lookup(nfd, &next_key, &nm) == 0 && nm.hash == static_hash) {
+                    is_static = 1;
+                }
+            }
+        }
+        if (is_static) {
+            int in_file = 0;
+            for (size_t i = 0; i < file_count; i++) {
+                if (file_ips[i] == next_key) {
+                    in_file = 1;
+                    break;
+                }
+            }
+            if (!in_file) {
+                if (stale_ips && stale_count >= stale_cap) {
+                    stale_cap *= 2;
+                    __u32 *stmp = realloc(stale_ips, stale_cap * sizeof(__u32));
+                    if (stmp) stale_ips = stmp;
+                }
+                if (stale_ips && stale_count < stale_cap) {
+                    stale_ips[stale_count++] = next_key;
+                }
+            }
+        }
+        key = next_key;
+        cur_key = &key;
+    }
+
+    int removed = 0;
+    if (stale_ips) {
+        for (size_t i = 0; i < stale_count; i++) {
+            __u32 del_k = stale_ips[i];
+            if (bpf_map_delete(fd, &del_k) == 0) {
+                removed++;
+                if (nfd >= 0) bpf_map_delete(nfd, &del_k);
+                if (tfd >= 0) bpf_map_delete(tfd, &del_k);
+            }
+        }
+        free(stale_ips);
+    }
+
+    /* Insert or refresh all IPs from file */
+    int loaded = 0;
+    __u64 expire_ts = 0xFFFFFFFFFFFFFFFFULL;
+    for (size_t i = 0; i < file_count; i++) {
+        __u32 ip_k = file_ips[i];
+        if (bpf_map_update(fd, &ip_k, &expire_ts, BPF_ANY) == 0) {
+            if (nfd >= 0) {
+                struct xdns_ip_name nm;
+                nm.hash = static_hash;
+                bpf_map_update(nfd, &ip_k, &nm, BPF_ANY);
+            }
+            loaded++;
+        }
+    }
+    free(file_ips);
+
     close(fd);
     if (nfd >= 0) close(nfd);
+    if (tfd >= 0) close(tfd);
 
-    printf("Successfully loaded %d static redirect IPs from %s\n", count, path);
+    printf("Successfully synchronized static redirect IPs: %d active (removed %d) from %s\n",
+           loaded, removed, path);
     return 0;
 }
 
@@ -519,28 +644,62 @@ static int cmd_clear_ips(void)
         perror("Failed to open xdns_ip_set map");
         return 1;
     }
-
-    __u32 key = 0;
-    int deleted = bpf_map_clear(fd, &key, sizeof(key));
-    close(fd);
-    if (deleted < 0) {
-        perror("Failed to clear xdns_ip_set");
-        return 1;
-    }
     int tfd = bpf_open_map("xdns_ip_traffic");
-    if (tfd >= 0) {
-        key = 0;
-        bpf_map_clear(tfd, &key, sizeof(key));
-        close(tfd);
-    }
     int nfd = bpf_open_map("xdns_ip_name");
-    if (nfd >= 0) {
-        key = 0;
-        bpf_map_clear(nfd, &key, sizeof(key));
-        close(nfd);
+
+    size_t cap = 256;
+    __u32 *to_delete = malloc(cap * sizeof(__u32));
+    size_t to_delete_count = 0;
+
+    __u32 key, next_key;
+    __u32 *cur_key = NULL;
+    __u64 static_hash = xdns_hash_domain("[static]");
+
+    while (bpf_map_get_next_key(fd, cur_key, &next_key) == 0) {
+        __u64 expire_ts = 0;
+        int is_static = 0;
+        if (bpf_map_lookup(fd, &next_key, &expire_ts) == 0) {
+            if (expire_ts == 0xFFFFFFFFFFFFFFFFULL) {
+                is_static = 1;
+            } else if (nfd >= 0) {
+                struct xdns_ip_name nm;
+                if (bpf_map_lookup(nfd, &next_key, &nm) == 0 && nm.hash == static_hash) {
+                    is_static = 1;
+                }
+            }
+        }
+        if (!is_static) {
+            if (to_delete && to_delete_count >= cap) {
+                cap *= 2;
+                __u32 *tmp = realloc(to_delete, cap * sizeof(__u32));
+                if (tmp) to_delete = tmp;
+            }
+            if (to_delete && to_delete_count < cap) {
+                to_delete[to_delete_count++] = next_key;
+            }
+        }
+        key = next_key;
+        cur_key = &key;
     }
 
-    printf("Cleared %d resolved IPs from xdns_ip_set\n", deleted);
+    int deleted = 0;
+    if (to_delete) {
+        for (size_t i = 0; i < to_delete_count; i++) {
+            __u32 del_k = to_delete[i];
+            if (bpf_map_delete(fd, &del_k) == 0) {
+                deleted++;
+                if (tfd >= 0) bpf_map_delete(tfd, &del_k);
+                if (nfd >= 0) bpf_map_delete(nfd, &del_k);
+            }
+        }
+        free(to_delete);
+    }
+
+    close(fd);
+    if (tfd >= 0) close(tfd);
+    if (nfd >= 0) close(nfd);
+
+    printf("Cleared %d dynamic resolved IPs from xdns_ip_set (preserved static redirect IPs)\n", deleted);
     return 0;
 }
 
@@ -571,8 +730,10 @@ static int cmd_reload_domains(const char *file)
            path, removed, loaded);
 
     /* Learned IPs belong to the previous domain set; drop them so traffic
-     * is not still steered until TTL expiry. */
-    return cmd_clear_ips();
+     * is not still steered until TTL expiry. Static redirect IPs are preserved. */
+    cmd_clear_ips();
+    cmd_load_ips(NULL);
+    return 0;
 }
 
 static int cmd_list_domains(const char *file)

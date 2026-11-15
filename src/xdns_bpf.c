@@ -493,18 +493,23 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
                             if ((void *)(ptr + 14) > data_end) break;
                             __u32 ans_ip = 0;
                             __builtin_memcpy(&ans_ip, ptr + 10, 4);
-                            __u32 ttl_sec = bpf_ntohl(attl);
-                            if (ttl_sec < 60) ttl_sec = 60;
-                            if (ttl_sec > 86400) ttl_sec = 86400;
 
-                            __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
-                            if (bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY) == 0) {
-                                if (stats) stats->dns_answers_learned++;
-                                if (nlearned == 0) lip0 = ans_ip;
-                                else if (nlearned == 1) lip1 = ans_ip;
-                                else if (nlearned == 2) lip2 = ans_ip;
-                                else if (nlearned == 3) lip3 = ans_ip;
-                                if (nlearned < 4) nlearned++;
+                            /* Do not overwrite permanent static redirect entries */
+                            __u64 *existing = bpf_map_lookup_elem(&xdns_ip_set, &ans_ip);
+                            if (!existing || *existing != 0xFFFFFFFFFFFFFFFFULL) {
+                                __u32 ttl_sec = bpf_ntohl(attl);
+                                if (ttl_sec < 60) ttl_sec = 60;
+                                if (ttl_sec > 86400) ttl_sec = 86400;
+
+                                __u64 expire_ts = bpf_ktime_get_ns() + ((__u64)ttl_sec * 1000000000ULL);
+                                if (bpf_map_update_elem(&xdns_ip_set, &ans_ip, &expire_ts, BPF_ANY) == 0) {
+                                    if (stats) stats->dns_answers_learned++;
+                                    if (nlearned == 0) lip0 = ans_ip;
+                                    else if (nlearned == 1) lip1 = ans_ip;
+                                    else if (nlearned == 2) lip2 = ans_ip;
+                                    else if (nlearned == 3) lip3 = ans_ip;
+                                    if (nlearned < 4) nlearned++;
+                                }
                             }
                         }
 
