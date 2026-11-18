@@ -35,6 +35,12 @@ struct xdns_tcp_session_val {
     __u16 orig_dst_port; /* Network byte order */
     __u16 pad;
     __u64 timestamp;
+    __u64 packets;
+    __u64 bytes;
+    __u32 cur_s_bytes;   /* Bytes in the current 4s rate slot */
+    __u32 prev_s_bytes;  /* Bytes in the previous 4s rate slot */
+    __u32 est_slot;      /* Monotonic seconds / 4 */
+    __u32 reserved;
 };
 
 /* Host socket cookie tracking value for connect4 -> sockops -> getsockopt */

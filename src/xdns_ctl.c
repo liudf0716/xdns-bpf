@@ -916,6 +916,32 @@ static int cmd_list_ips(void)
     return 0;
 }
 
+/* Bits/s from the same 4-second slots aw-bpf uses. */
+static unsigned int session_rate_bps(const struct xdns_tcp_session_val *v, unsigned int now)
+{
+    const unsigned int slot = 4;
+    unsigned int est = now / slot;
+    unsigned long long prev = 0, cur = 0;
+    unsigned int elapsed = now % slot;
+    unsigned int remain = slot - elapsed;
+
+    if (v->est_slot == est) {
+        prev = v->prev_s_bytes;
+        cur = v->cur_s_bytes;
+    } else if (v->est_slot + 1 == est) {
+        prev = v->cur_s_bytes;
+        elapsed = 0;
+        remain = slot;
+    } else if (v->est_slot + 2 == est && elapsed < slot / 2) {
+        prev = v->cur_s_bytes / 2;
+        elapsed = 0;
+        remain = slot;
+    } else {
+        return 0;
+    }
+    return (unsigned int)((prev * remain + cur * elapsed) * 8 / (slot * slot));
+}
+
 static int cmd_list_sessions(void)
 {
     int fd = bpf_open_map("xdns_tcp_sessions");
@@ -929,8 +955,9 @@ static int cmd_list_sessions(void)
     int nnames = 0;
     load_name_table(&names, &nnames);
 
-    printf("%-32s %-24s %-24s %-12s\n", "Website", "Client Endpoint", "Original Target", "Last Seen");
-    printf("------------------------------------------------------------------------------------------------\n");
+    printf("%-32s %-24s %-24s %-10s %-16s %-12s\n",
+           "Website", "Client Endpoint", "Original Target", "Last Seen", "Bytes", "Ratebps");
+    printf("----------------------------------------------------------------------------------------------------------------\n");
 
     struct xdns_tcp_session_key key, next_key;
     memset(&key, 0, sizeof(key));
@@ -971,7 +998,11 @@ static int cmd_list_sessions(void)
             }
 
             unsigned long long age_sec = (now_ns > val.timestamp) ? (now_ns - val.timestamp) / 1000000000ULL : 0;
-            printf("%-32s %-24s %-24s %llus ago\n", website, cstr, tstr, age_sec);
+            char agestr[16];
+            snprintf(agestr, sizeof(agestr), "%llus", age_sec);
+            unsigned int rate = session_rate_bps(&val, (unsigned int)ts.tv_sec);
+            printf("%-32s %-24s %-24s %-10s %-16llu %-12u\n",
+                   website, cstr, tstr, agestr, (unsigned long long)val.bytes, rate);
             count++;
         }
 
@@ -984,7 +1015,7 @@ static int cmd_list_sessions(void)
     if (nfd >= 0)
         close(nfd);
     close(fd);
-    printf("------------------------------------------------------------------------------------------------\n");
+    printf("----------------------------------------------------------------------------------------------------------------\n");
     printf("Total active TCP sessions: %d\n", count);
     return 0;
 }

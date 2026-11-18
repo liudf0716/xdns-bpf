@@ -202,6 +202,25 @@ static __always_inline struct xdns_stats *stats_slot(void)
     return bpf_map_lookup_elem(&xdns_stats_map, &key);
 }
 
+/* Same 4-second slot estimator as aw-bpf update_stats(). */
+static __always_inline void account_session(struct xdns_tcp_session_val *v, __u32 bytes, __u64 now)
+{
+    __u32 now_sec = (__u32)(now / 1000000000ULL);
+    __u32 est_slot = now_sec / 4;
+    __u32 old_slot = v->est_slot;
+
+    if (old_slot == est_slot) {
+        v->cur_s_bytes += bytes;
+    } else {
+        v->prev_s_bytes = (old_slot == est_slot - 1) ? v->cur_s_bytes : 0;
+        v->cur_s_bytes = bytes;
+        v->est_slot = est_slot;
+    }
+    v->bytes += bytes;
+    v->packets += 1;
+    v->timestamp = now;
+}
+
 static __always_inline void account_ip(__u32 ip, __u32 bytes, int new_conn)
 {
     struct xdns_ip_traffic *t = bpf_map_lookup_elem(&xdns_ip_traffic, &ip);
@@ -343,6 +362,7 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
                     .pad = 0,
                     .timestamp = now,
                 };
+                account_session(&t_val, bpf_ntohs(ip->tot_len), now);
                 bpf_map_update_elem(&xdns_tcp_sessions, &t_key, &t_val, BPF_ANY);
                 redirect = 1;
             } else {
@@ -354,6 +374,7 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
         } else {
             /* Established packet: verify session matches exact original destination */
             struct xdns_tcp_session_val *existing = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
+            __u64 now = bpf_ktime_get_ns();
             if (existing && existing->orig_dst_ip == ip->daddr && existing->orig_dst_port == tcp->dest) {
                 redirect = 1;
                 if (stats) {
@@ -361,6 +382,7 @@ static __always_inline int process_outbound(struct __sk_buff *skb)
                     stats->tcp_bytes += bpf_ntohs(ip->tot_len);
                 }
                 account_ip(existing->orig_dst_ip, bpf_ntohs(ip->tot_len), 0);
+                account_session(existing, bpf_ntohs(ip->tot_len), now);
                 if (is_rst) {
                     bpf_map_delete_elem(&xdns_tcp_sessions, &t_key);
                 }
@@ -583,11 +605,13 @@ static __always_inline int process_inbound(struct __sk_buff *skb)
             struct xdns_tcp_session_val *t_val = bpf_map_lookup_elem(&xdns_tcp_sessions, &t_key);
             if (t_val) {
                 struct xdns_stats *stats = stats_slot();
+                __u64 now = bpf_ktime_get_ns();
                 if (stats) {
                     stats->tcp_packets++;
                     stats->tcp_bytes += bpf_ntohs(ip->tot_len);
                 }
                 account_ip(t_val->orig_dst_ip, bpf_ntohs(ip->tot_len), 0);
+                account_session(t_val, bpf_ntohs(ip->tot_len), now);
 
                 __u32 old_saddr = ip->saddr;
                 __u32 new_saddr = t_val->orig_dst_ip;
